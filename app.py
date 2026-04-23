@@ -36,6 +36,11 @@ from panovggt.utils.basic import (
     save_cameras_as_colmap,
     predictions_to_glb,
 )
+from panovggt.utils.gaussian import (
+    gaussian_keys_in,
+    save_gaussian_centers_ply,
+    save_gaussian_predictions,
+)
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 _EXAMPLE_DIR = "examples"
@@ -104,6 +109,7 @@ def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTM
     cfg = OmegaConf.load(config_path)
     OmegaConf.resolve(cfg)
     mc = cfg.model
+    gaussian_head_cfg = getattr(mc, "gaussian_head", None)
     model = PanoVGGTModel(
         img_size=cfg.img_size,
         patch_size=cfg.patch_size,
@@ -111,6 +117,13 @@ def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTM
         enable_camera=mc.enable_camera,
         enable_depth=mc.enable_depth,
         enable_point=mc.enable_point,
+        enable_global_points=getattr(mc, "enable_global_points", True),
+        enable_3dgs=getattr(mc, "enable_3dgs", False),
+        gaussian_head=(
+            OmegaConf.to_container(gaussian_head_cfg, resolve=True)
+            if gaussian_head_cfg is not None
+            else None
+        ),
         aggregator=OmegaConf.to_container(mc.aggregator, resolve=True),
     )
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -176,6 +189,20 @@ def run_model(
             out[k] = (v.float() if v.dtype == torch.bfloat16 else v).cpu().numpy().squeeze(0)
         else:
             out[k] = v
+
+    gaussian_keys = gaussian_keys_in(out)
+    if gaussian_keys:
+        gaussian_dir = os.path.join(target_dir, "gaussians")
+        os.makedirs(gaussian_dir, exist_ok=True)
+        flattened = save_gaussian_predictions(
+            os.path.join(gaussian_dir, "gaussians.npz"), out
+        )
+        if flattened is not None:
+            save_gaussian_centers_ply(
+                os.path.join(gaussian_dir, "gaussian_centers.ply"), flattened
+            )
+        for key in gaussian_keys:
+            out.pop(key, None)
 
     if "depth" in out and out["depth"] is not None:
         d = out["depth"]

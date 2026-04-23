@@ -26,6 +26,11 @@ import torch
 from omegaconf import OmegaConf
 
 from panovggt.models.panovggt_model import PanoVGGTModel
+from panovggt.utils.gaussian import (
+    gaussian_keys_in,
+    save_gaussian_centers_ply,
+    save_gaussian_predictions,
+)
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
@@ -42,6 +47,7 @@ def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTM
     cfg = OmegaConf.load(config_path)
     OmegaConf.resolve(cfg)
     mc = cfg.model
+    gaussian_head_cfg = getattr(mc, "gaussian_head", None)
     model = PanoVGGTModel(
         img_size=cfg.img_size,
         patch_size=cfg.patch_size,
@@ -49,6 +55,13 @@ def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTM
         enable_camera=mc.enable_camera,
         enable_depth=mc.enable_depth,
         enable_point=mc.enable_point,
+        enable_global_points=getattr(mc, "enable_global_points", True),
+        enable_3dgs=getattr(mc, "enable_3dgs", False),
+        gaussian_head=(
+            OmegaConf.to_container(gaussian_head_cfg, resolve=True)
+            if gaussian_head_cfg is not None
+            else None
+        ),
         aggregator=OmegaConf.to_container(mc.aggregator, resolve=True),
     )
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -258,6 +271,27 @@ def save_ply(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
     print(f"  [ply] saved {N:,} points → {path}")
 
 
+def save_gaussian_artifacts(predictions: dict, output_dir: str) -> Optional[str]:
+    if not gaussian_keys_in(predictions):
+        return None
+
+    gaussian_dir = os.path.join(output_dir, "gaussians")
+    os.makedirs(gaussian_dir, exist_ok=True)
+
+    gaussian_npz = os.path.join(gaussian_dir, "gaussians.npz")
+    flattened = save_gaussian_predictions(gaussian_npz, predictions)
+    if flattened is None:
+        return None
+
+    save_gaussian_centers_ply(
+        os.path.join(gaussian_dir, "gaussian_centers.ply"), flattened
+    )
+    print(
+        f"[pipeline] Gaussian artifacts saved ({len(flattened['means']):,} splats) -> {gaussian_dir}"
+    )
+    return gaussian_npz
+
+
 # =========================================================================
 #  6.  Inference
 # =========================================================================
@@ -340,6 +374,7 @@ def main(args: argparse.Namespace) -> None:
 
     # ── inference ─────────────────────────────────────────────────────────
     preds = run_inference(model, image_paths, device)
+    save_gaussian_artifacts(preds, out_root)
 
     # ── unpack predictions ────────────────────────────────────────────────
     # After squeeze, expected shapes:

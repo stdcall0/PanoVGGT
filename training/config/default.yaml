@@ -101,6 +101,14 @@ logging:
         - loss_grad_point
         - loss_local_point
         - loss_global_point
+        - loss_gaussian
+        - loss_gaussian_center
+        - loss_gaussian_scale
+        - loss_gaussian_rotation
+        - loss_gaussian_opacity
+        - loss_gaussian_keep
+        - loss_gaussian_split
+        - loss_gaussian_sh
     val:
       keys_to_log:
         - loss_objective
@@ -111,6 +119,14 @@ logging:
         - loss_grad_point
         - loss_local_point
         - loss_global_point
+        - loss_gaussian
+        - loss_gaussian_center
+        - loss_gaussian_scale
+        - loss_gaussian_rotation
+        - loss_gaussian_opacity
+        - loss_gaussian_keep
+        - loss_gaussian_split
+        - loss_gaussian_sh
 
 
 checkpoint:
@@ -123,6 +139,10 @@ checkpoint:
 loss:
   _target_: panovggt.models.loss.Loss
   train_conf: ${model.train_conf}
+  enable_3dgs: ${model.enable_3dgs}
+  gaussian_head: ${model.gaussian_head}
+  gaussian_loss_weight: 0.2
+  patch_size: ${patch_size}
 
 
 optim:
@@ -152,6 +172,9 @@ optim:
         max_norm: 1.0
         norm_type: 2
       - module_name: ["point"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["gaussian_decoder", "gaussian_stage1_head", "gaussian_param_head"]
         max_norm: 1.0
         norm_type: 2
       - module_name: ["pos"]
@@ -187,8 +210,22 @@ model:
   enable_camera: True
   enable_depth: True
   enable_point: True
+  enable_global_points: True
+  enable_3dgs: False
   enable_track: False
   train_conf: False
+  gaussian_head:
+    enable_stage1: True
+    keep_threshold: 0.35
+    max_gaussians_per_token: 4
+    sh_degree: 3
+    dec_embed_dim: 1024
+    dec_num_heads: 16
+    out_dim: 1024
+    stage1_hidden_dim: 512
+    mlp_hidden_dim: 1024
+    log_scale_min: -6.0
+    log_scale_max: 1.5
   aggregator:
     depth: 36
     num_heads: 16

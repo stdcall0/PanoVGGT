@@ -13,6 +13,11 @@ from panovggt.layers.transformer_head import (
     LinearPts3d,
     ContextTransformerDecoder,
 )
+from panovggt.layers.gaussian_head import (
+    GaussianParameterHead,
+    GaussianStage1Head,
+    assemble_gaussian_outputs,
+)
 from panovggt.layers.camera_head import CameraHead
 
 
@@ -123,6 +128,19 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         "use_pano_pos": True,
         "pos_mlp_hidden": 1024,
     }
+    DEFAULT_GAUSSIAN_HEAD_CONFIG = {
+        "enable_stage1": True,
+        "keep_threshold": 0.35,
+        "max_gaussians_per_token": 4,
+        "sh_degree": 3,
+        "dec_embed_dim": 1024,
+        "dec_num_heads": 16,
+        "out_dim": 1024,
+        "stage1_hidden_dim": 512,
+        "mlp_hidden_dim": 1024,
+        "log_scale_min": -6.0,
+        "log_scale_max": 1.5,
+    }
 
     def __init__(
         self,
@@ -134,12 +152,20 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         enable_point: bool = True,
         enable_depth: bool = True,
         enable_global_points: bool = True,
+        enable_3dgs: bool = False,
+        gaussian_head: dict = None,
         **kwargs,
     ):
         super().__init__()
 
         if aggregator is None:
             aggregator = self.DEFAULT_AGGREGATOR_CONFIG.copy()
+        if gaussian_head is None:
+            gaussian_head = self.DEFAULT_GAUSSIAN_HEAD_CONFIG.copy()
+        else:
+            merged_gaussian_head = self.DEFAULT_GAUSSIAN_HEAD_CONFIG.copy()
+            merged_gaussian_head.update(gaussian_head)
+            gaussian_head = merged_gaussian_head
 
         # 1) Aggregator
         self.aggregator = Aggregator(
@@ -152,6 +178,8 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         self.enable_point = enable_point
         self.enable_depth = enable_depth
         self.enable_global_points = enable_global_points
+        self.enable_3dgs = enable_3dgs
+        self.gaussian_head_config = gaussian_head
 
         # 3) Decoder heads
         in_dim_for_decoders = 2 * embed_dim
@@ -191,6 +219,34 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 patch_size=self.patch_size, dec_embed_dim=1024, output_dim=3,
             )
 
+        if self.enable_3dgs:
+            self.gaussian_stage1_enabled = bool(
+                gaussian_head.get("enable_stage1", True)
+            )
+            self.gaussian_keep_threshold = float(
+                gaussian_head.get("keep_threshold", 0.35)
+            )
+            self.gaussian_decoder = ContextTransformerDecoder(
+                in_dim=in_dim_for_decoders,
+                dec_embed_dim=gaussian_head["dec_embed_dim"],
+                dec_num_heads=gaussian_head["dec_num_heads"],
+                out_dim=gaussian_head["out_dim"],
+                rope=getattr(self.aggregator, "rope", None),
+            )
+            self.gaussian_stage1_head = GaussianStage1Head(
+                in_dim=gaussian_head["out_dim"],
+                hidden_dim=gaussian_head["stage1_hidden_dim"],
+                max_gaussians_per_token=gaussian_head["max_gaussians_per_token"],
+            )
+            self.gaussian_param_head = GaussianParameterHead(
+                in_dim=gaussian_head["out_dim"],
+                hidden_dim=gaussian_head["mlp_hidden_dim"],
+                max_gaussians_per_token=gaussian_head["max_gaussians_per_token"],
+                sh_degree=gaussian_head["sh_degree"],
+                log_scale_min=gaussian_head["log_scale_min"],
+                log_scale_max=gaussian_head["log_scale_max"],
+            )
+
         # 4) Absolute spherical position encoding adapters
         if not hasattr(self.aggregator, "pano_pos_mlp"):
             raise AttributeError(
@@ -227,6 +283,15 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             self.pos_adapters["global"] = PositionAdapter(
                 in_dim=self.Cpos, out_dim=dim,
                 init_as_identity=True, residual_scale=0.0,
+            )
+
+        if self.enable_3dgs:
+            dim, _ = self._get_dec_cfg(self.gaussian_decoder)
+            self.pos_adapters["gaussian"] = PositionAdapter(
+                in_dim=self.Cpos,
+                out_dim=dim,
+                init_as_identity=True,
+                residual_scale=0.0,
             )
 
         # Direction vector cache for equirectangular projection
@@ -274,6 +339,26 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         elif self._direction_vectors_cache.device != device:
             self._direction_vectors_cache = self._direction_vectors_cache.to(device)
         return self._direction_vectors_cache
+
+    def _build_anchor_context(
+        self, tokens: torch.Tensor, batch_size: int, num_frames: int
+    ) -> torch.Tensor:
+        _, num_tokens, channels = tokens.shape
+        tokens_4d = tokens.reshape(batch_size, num_frames, num_tokens, channels)
+
+        if self.training:
+            anchor_idx = torch.randint(0, num_frames, (batch_size,), device=tokens.device)
+            context = (
+                tokens_4d[torch.arange(batch_size, device=tokens.device), anchor_idx]
+                .unsqueeze(1)
+                .expand(batch_size, num_frames, num_tokens, channels)
+            )
+        else:
+            mid_idx = num_frames // 2
+            context = tokens_4d[:, mid_idx : mid_idx + 1].expand(
+                batch_size, num_frames, num_tokens, channels
+            )
+        return context.reshape(batch_size * num_frames, num_tokens, channels)
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
         if images.dim() == 4:
@@ -354,28 +439,12 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points"] = world
                 predictions["points"] = world
 
+        context = None
+        if self.enable_global_points or self.enable_3dgs:
+            context = self._build_anchor_context(tokens, B, S)
+
         # --- Global points branch ---
         if self.enable_global_points:
-            BN, P, C2 = tokens.shape  # BN == B*S
-
-            tokens_4d = tokens.reshape(B, S, P, C2)
-
-            if self.training:
-                anchor_idx = torch.randint(0, S, (B,), device=tokens.device)
-                context = (
-                    tokens_4d[torch.arange(B, device=tokens.device), anchor_idx]
-                    .unsqueeze(1)
-                    .expand(B, S, P, C2)
-                    .reshape(B * S, P, C2)
-                )
-            else:
-                mid_idx = S // 2
-                context = (
-                    tokens_4d[:, mid_idx : mid_idx + 1]
-                    .expand(B, S, P, C2)
-                    .reshape(B * S, P, C2)
-                )
-
             pos_bs_global = self._get_branch_pos_embed(
                 patch_h, patch_w, patch_start_idx,
                 tokens.device, tokens.dtype, "global", B * S,
@@ -391,6 +460,55 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             predictions["global_points"] = global_points
         else:
             predictions["global_points"] = None
+
+        # --- 3D Gaussian Splatting branch ---
+        if self.enable_3dgs:
+            pos_bs_gaussian = self._get_branch_pos_embed(
+                patch_h,
+                patch_w,
+                patch_start_idx,
+                tokens.device,
+                tokens.dtype,
+                "gaussian",
+                B * S,
+            )
+            gaussian_hidden = self.gaussian_decoder(
+                tokens,
+                context,
+                pos_embed=pos_bs_gaussian,
+                xpos=pos_2d,
+                ypos=pos_2d,
+            )
+            with torch.amp.autocast(device_type="cuda", enabled=False):
+                gaussian_hidden = gaussian_hidden.float()
+                gaussian_patch_tokens = gaussian_hidden[:, patch_start_idx:]
+                stage1_outputs = self.gaussian_stage1_head(
+                    gaussian_patch_tokens,
+                    batch_size=B,
+                    num_frames=S,
+                    patch_h=patch_h,
+                    patch_w=patch_w,
+                    enabled=self.gaussian_stage1_enabled,
+                )
+                param_outputs = self.gaussian_param_head(
+                    gaussian_patch_tokens,
+                    batch_size=B,
+                    num_frames=S,
+                    patch_h=patch_h,
+                    patch_w=patch_w,
+                )
+                gaussian_outputs = assemble_gaussian_outputs(
+                    stage1_outputs,
+                    param_outputs,
+                    keep_threshold=(
+                        self.gaussian_keep_threshold if not self.training else None
+                    ),
+                    use_stage1=self.gaussian_stage1_enabled,
+                )
+
+            predictions.update(stage1_outputs)
+            predictions.update(param_outputs)
+            predictions.update(gaussian_outputs)
 
         if not self.training:
             predictions["images"] = images
