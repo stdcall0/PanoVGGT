@@ -128,6 +128,9 @@ class Trainer:
 
         # 5) Restore model weights before DDP wrapping.
         ckpt_path = self.checkpoint_conf.resume_checkpoint_path or get_resume_checkpoint(self.checkpoint_conf.save_dir)
+        init_ckpt_path = getattr(self.checkpoint_conf, "init_checkpoint_path", None)
+        if ckpt_path is None and init_ckpt_path is not None:
+            self._load_initial_checkpoint(init_ckpt_path)
         if ckpt_path is not None:
             
             self._load_resuming_checkpoint(ckpt_path, load_model=True, load_optim=False)
@@ -218,7 +221,7 @@ class Trainer:
             self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
         else:
             if "prev_epoch" in checkpoint:
-                self.epoch = checkpoint["prev_epoch"]
+                self.epoch = checkpoint["prev_epoch"] + 1
             elif "epoch" in checkpoint:
                 self.epoch = checkpoint["epoch"]
             else:
@@ -235,6 +238,22 @@ class Trainer:
                     self.scaler.load_state_dict(checkpoint["scaler"])
                 except Exception as e:
                     logging.warning(f"Failed to load AMP scaler: {e}")
+
+    def _load_initial_checkpoint(self, ckpt_path: str):
+        """Load model weights only, without restoring optimizer or training progress."""
+        logging.info(f"Initializing model weights from {ckpt_path} (rank {self.rank})")
+        with g_pathmgr.open(ckpt_path, "rb") as f:
+            checkpoint = torch.load(f, map_location="cpu", weights_only=True)
+
+        model_state_dict = checkpoint.get("model", checkpoint)
+        target_model = self.model.module if isinstance(self.model, nn.parallel.DistributedDataParallel) else self.model
+        missing, unexpected = target_model.load_state_dict(
+            model_state_dict, strict=self.checkpoint_conf.strict
+        )
+        if self.rank == 0:
+            logging.info(
+                f"Initialized model. Missing: {missing or 'None'}, Unexpected: {unexpected or 'None'}."
+            )
 
     def _setup_device(self, device: str):
         self.local_rank, self.distributed_rank = get_machine_local_and_dist_rank()
@@ -706,7 +725,13 @@ class Trainer:
 def chunk_batch_for_accum_steps(batch: Mapping, accum_steps: int) -> List[Mapping]:
     if accum_steps == 1:
         return [batch]
-    return [get_chunk_from_data(batch, i, accum_steps) for i in range(accum_steps)]
+    batch_size = get_chunkable_length(batch)
+    if batch_size is None or batch_size <= 1:
+        return [batch]
+
+    effective_chunks = min(accum_steps, batch_size)
+    chunked_batches = [get_chunk_from_data(batch, i, effective_chunks) for i in range(effective_chunks)]
+    return [chunk for chunk in chunked_batches if get_chunkable_length(chunk) not in (None, 0)]
 
 
 def is_sequence_of_primitives(data: Any) -> bool:
@@ -718,10 +743,28 @@ def is_sequence_of_primitives(data: Any) -> bool:
     )
 
 
+def get_chunkable_length(data: Any) -> Optional[int]:
+    if isinstance(data, torch.Tensor) or is_sequence_of_primitives(data):
+        return len(data)
+    if isinstance(data, Mapping):
+        for value in data.values():
+            length = get_chunkable_length(value)
+            if length is not None:
+                return length
+        return None
+    if isinstance(data, Sequence) and not isinstance(data, str):
+        for value in data:
+            length = get_chunkable_length(value)
+            if length is not None:
+                return length
+        return None
+    return None
+
+
 def get_chunk_from_data(data: Any, chunk_id: int, num_chunks: int) -> Any:
     if isinstance(data, torch.Tensor) or is_sequence_of_primitives(data):
-        start = (len(data) // num_chunks) * chunk_id
-        end = (len(data) // num_chunks) * (chunk_id + 1)
+        start = (len(data) * chunk_id) // num_chunks
+        end = (len(data) * (chunk_id + 1)) // num_chunks
         return data[start:end]
     elif isinstance(data, Mapping):
         return {key: get_chunk_from_data(value, chunk_id, num_chunks) for key, value in data.items()}

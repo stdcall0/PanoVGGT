@@ -7,10 +7,23 @@
 # TORCH_NCCL_ASYNC_ERROR_HANDLING=1 torchrun --standalone --nproc_per_node=8 training/launch.py
 
 import os
+import sys
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 # os.environ['CUDA_VISIBLE_DEVICES'] = '4,5,6,7'
 # os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
 import argparse
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+TRAINING_ROOT = os.path.dirname(os.path.abspath(__file__))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+if TRAINING_ROOT not in sys.path:
+    sys.path.insert(0, TRAINING_ROOT)
+
+from panovggt.utils.runtime_env import bootstrap_gsplat_runtime
+
+bootstrap_gsplat_runtime()
+
 from hydra import initialize, compose
 from omegaconf import DictConfig, OmegaConf
 from trainer import Trainer
@@ -35,5 +48,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

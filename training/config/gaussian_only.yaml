@@ -1,0 +1,42 @@
+defaults:
+  - default
+  - _self_
+
+exp_name: gaussian_only
+
+logging:
+  log_dir: outputs
+
+checkpoint:
+  save_dir: ${logging.log_dir}/${exp_name}/ckpts
+  init_checkpoint_path: checkpoints/model.pt
+  resume_checkpoint_path: null
+  strict: False
+
+loss:
+  point_loss_weight: 0.0
+  camera_loss_weight: 0.0
+  gaussian_loss_weight: 1.0
+
+model:
+  enable_global_points: False
+  enable_3dgs: True
+
+optim:
+  frozen_module_names:
+    - aggregator
+    - point_decoder
+    - point_head
+    - camera_decoder
+    - camera_head
+    - pos_adapters.point
+    - pos_adapters.camera
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["gaussian_decoder", "gaussian_stage1_head", "gaussian_param_head"]
+        max_norm: 1.0
+        norm_type: 2
+      - module_name: ["pos_adapters.gaussian"]
+        max_norm: 1.0
+        norm_type: 2

@@ -9,6 +9,10 @@ import math
 import logging
 from typing import Dict, Optional, Tuple, Union
 
+from panovggt.utils.runtime_env import bootstrap_gsplat_runtime
+
+bootstrap_gsplat_runtime()
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,6 +20,7 @@ import torch.nn.functional as F
 from panovggt.utils.geometry import homogenize_points, se3_inverse, depth_edge
 from panovggt.utils.alignment import align_points_scale
 from panovggt.utils.rotation import mat_to_quat, quat_to_mat
+from panovggt.utils.gaussian_render import GaussianCubemapRenderLoss
 
 
 logger = logging.getLogger(__name__)
@@ -563,7 +568,7 @@ class GaussianLoss(nn.Module):
 
     Since the training data in this repository does not include rendered
     Gaussian-ground-truth assets, this loss derives token-level pseudo-targets
-    from patch-wise world-point statistics and RGB appearance.
+    from patch-wise canonical-global point statistics and RGB appearance.
     """
 
     def __init__(
@@ -572,21 +577,24 @@ class GaussianLoss(nn.Module):
         max_gaussians_per_token: int = 4,
         sh_degree: int = 3,
         enable_stage1: bool = True,
+        keep_target_threshold: float = 0.35,
         min_valid_fraction: float = 0.15,
-        center_weight: float = 1.0,
-        scale_weight: float = 0.2,
-        rotation_weight: float = 0.1,
-        opacity_weight: float = 0.15,
-        keep_weight: float = 0.1,
-        split_weight: float = 0.1,
-        sh_weight: float = 0.1,
-        offset_reg_weight: float = 0.02,
+        center_weight: float = 0.75,
+        scale_weight: float = 0.15,
+        rotation_weight: float = 0.08,
+        opacity_weight: float = 0.08,
+        keep_weight: float = 0.05,
+        split_weight: float = 0.05,
+        sh_weight: float = 0.08,
+        offset_reg_weight: float = 0.01,
+        render_config: Optional[Dict[str, object]] = None,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.max_gaussians_per_token = max_gaussians_per_token
         self.num_sh_bases = (sh_degree + 1) ** 2
         self.enable_stage1 = enable_stage1
+        self.keep_target_threshold = float(keep_target_threshold)
         self.min_valid_fraction = min_valid_fraction
 
         self.center_weight = center_weight
@@ -597,6 +605,21 @@ class GaussianLoss(nn.Module):
         self.split_weight = split_weight
         self.sh_weight = sh_weight
         self.offset_reg_weight = offset_reg_weight
+
+        render_config = render_config or {}
+        self.render_weight = float(render_config.get("weight", 0.0))
+        self.render_loss = None
+        if render_config.get("enabled", False) and self.render_weight > 0:
+            self.render_loss = GaussianCubemapRenderLoss(
+                cube_dim=render_config.get("cube_dim", 64),
+                face_indices=render_config.get("face_indices", (0, 1, 2, 3, 4, 5)),
+                rgb_weight=render_config.get("rgb_weight", 1.0),
+                depth_weight=render_config.get("depth_weight", 0.25),
+                alpha_weight=render_config.get("alpha_weight", 0.05),
+                opacity_floor=render_config.get("opacity_floor", 1e-4),
+                fov_degrees=render_config.get("fov_degrees", 90.0),
+                sh_degree=sh_degree,
+            )
 
     def _patchify_scalar(self, x: torch.Tensor) -> torch.Tensor:
         B, N, H, W = x.shape
@@ -623,7 +646,7 @@ class GaussianLoss(nn.Module):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         zero = pred_quat.new_tensor(0.0)
-        if not mask.any():
+        if not mask.any().item():
             return zero
 
         pred_rot = quat_to_mat(pred_quat)
@@ -635,11 +658,18 @@ class GaussianLoss(nn.Module):
         return angles[mask].mean()
 
     def _prepare_targets(self, gt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        world_points = gt["global_points"]
-        valid_masks = gt["valid_masks"]
+        global_points = gt["global_points"]
+        valid_masks = gt["valid_masks"].bool()
         images = gt["imgs"].permute(0, 1, 3, 4, 2).contiguous()
 
-        world_patches = self._patchify_vector(world_points)
+        finite_global = torch.isfinite(global_points).all(dim=-1)
+        finite_rgb = torch.isfinite(images).all(dim=-1)
+        valid_masks = valid_masks & finite_global & finite_rgb
+
+        global_points = torch.nan_to_num(global_points, nan=0.0, posinf=0.0, neginf=0.0)
+        images = torch.nan_to_num(images, nan=0.0, posinf=0.0, neginf=0.0)
+
+        global_patches = self._patchify_vector(global_points)
         image_patches = self._patchify_vector(images)
         valid_patches = self._patchify_scalar(valid_masks.float())
 
@@ -648,41 +678,93 @@ class GaussianLoss(nn.Module):
         valid_fraction = counts.squeeze(-1) / float(self.patch_size * self.patch_size)
         patch_valid = valid_fraction > self.min_valid_fraction
 
-        patch_means = (world_patches * weights[..., None]).sum(dim=-2) / counts
+        patch_means = (global_patches * weights[..., None]).sum(dim=-2) / counts
         patch_rgb = (image_patches * weights[..., None]).sum(dim=-2) / counts
 
-        centered_points = (world_patches - patch_means.unsqueeze(-2)) * weights[..., None]
+        centered_points = (global_patches - patch_means.unsqueeze(-2)) * weights[..., None]
         cov = torch.einsum(
             "bnhwpd,bnhwpe->bnhwde", centered_points, centered_points
         ) / counts[..., None]
         eye = torch.eye(3, device=cov.device, dtype=cov.dtype).view(1, 1, 1, 1, 3, 3)
         cov = cov + 1e-5 * eye
+        finite_cov = torch.isfinite(cov).all(dim=(-1, -2))
+        cov = torch.where(finite_cov[..., None, None], cov, eye.expand_as(cov))
+        patch_valid = patch_valid & finite_cov
 
-        eigvals, eigvecs = torch.linalg.eigh(cov)
-        eigvals, order = torch.sort(eigvals, dim=-1, descending=True)
-        gather_index = order.unsqueeze(-2).expand(*eigvecs.shape[:-2], 3, 3)
-        eigvecs = torch.gather(eigvecs, -1, gather_index)
-
-        det = torch.det(eigvecs)
-        last_col = eigvecs[..., :, -1] * torch.where(
-            det[..., None] < 0, -1.0, 1.0
+        log_scales = torch.zeros_like(patch_means)
+        rotations = torch.zeros(
+            *patch_means.shape[:-1], 4, device=patch_means.device, dtype=patch_means.dtype
         )
-        eigvecs = torch.cat([eigvecs[..., :, :2], last_col.unsqueeze(-1)], dim=-1)
+        rotations[..., 0] = 1.0
 
-        scales = torch.sqrt(eigvals.clamp_min(1e-6))
-        log_scales = torch.log(scales.clamp_min(1e-6))
-        rotations = mat_to_quat(eigvecs)
+        if patch_valid.any():
+            cov_valid = cov[patch_valid]
+            valid_log_scales = []
+            valid_rotations = []
+            cpu_fallback_used = False
+
+            for cov_chunk in cov_valid.split(8192):
+                cov_chunk = cov_chunk.float()
+                try:
+                    eigvals_chunk, eigvecs_chunk = torch.linalg.eigh(cov_chunk)
+                except RuntimeError:
+                    eigvals_chunk_cpu, eigvecs_chunk_cpu = torch.linalg.eigh(cov_chunk.cpu())
+                    eigvals_chunk = eigvals_chunk_cpu.to(cov_chunk.device)
+                    eigvecs_chunk = eigvecs_chunk_cpu.to(cov_chunk.device)
+                    cpu_fallback_used = True
+
+                eigvals_chunk, order = torch.sort(eigvals_chunk, dim=-1, descending=True)
+                gather_index = order.unsqueeze(-2).expand(-1, 3, 3)
+                eigvecs_chunk = torch.gather(eigvecs_chunk, -1, gather_index)
+
+                det = torch.det(eigvecs_chunk)
+                last_col = eigvecs_chunk[..., :, -1] * torch.where(
+                    det[..., None] < 0, -1.0, 1.0
+                )
+                eigvecs_chunk = torch.cat(
+                    [eigvecs_chunk[..., :, :2], last_col.unsqueeze(-1)], dim=-1
+                )
+
+                scales_chunk = torch.sqrt(eigvals_chunk.clamp_min(1e-6))
+                log_scales_chunk = torch.log(scales_chunk.clamp_min(1e-6))
+                rotations_chunk = mat_to_quat(eigvecs_chunk)
+                rotations_chunk = torch.nan_to_num(
+                    rotations_chunk, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                rotations_norm = rotations_chunk.norm(dim=-1, keepdim=True)
+                default_quat = torch.zeros_like(rotations_chunk)
+                default_quat[..., 0] = 1.0
+                rotations_chunk = torch.where(
+                    rotations_norm > 1e-6,
+                    rotations_chunk / rotations_norm.clamp_min(1e-6),
+                    default_quat,
+                )
+
+                valid_log_scales.append(log_scales_chunk.to(log_scales.dtype))
+                valid_rotations.append(rotations_chunk.to(rotations.dtype))
+
+            if cpu_fallback_used:
+                logging.warning("Gaussian target eigendecomposition fell back to CPU for at least one chunk.")
+
+            log_scales[patch_valid] = torch.cat(valid_log_scales, dim=0)
+            rotations[patch_valid] = torch.cat(valid_rotations, dim=0)
 
         rgb_var = (
             ((image_patches - patch_rgb.unsqueeze(-2)) ** 2) * weights[..., None]
         ).sum(dim=(-2, -1)) / counts.squeeze(-1)
-        geom_var = scales.mean(dim=-1)
-        detail_raw = rgb_var + geom_var
-        detail_norm = detail_raw / detail_raw.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        geom_var = log_scales.exp().mean(dim=-1)
+        rgb_detail = rgb_var / rgb_var.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        geom_detail = geom_var / geom_var.amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        detail_norm = 0.35 * rgb_detail + 0.65 * geom_detail
         detail_norm = detail_norm * patch_valid.float()
 
         importance_target = (
-            0.25 * valid_fraction + 0.75 * detail_norm
+            0.40 * valid_fraction + 0.60 * detail_norm
+        ).clamp_(0.0, 1.0)
+        keep_target = patch_valid & (importance_target >= self.keep_target_threshold)
+        opacity_target = (
+            (importance_target - self.keep_target_threshold)
+            / max(1.0 - self.keep_target_threshold, 1e-6)
         ).clamp_(0.0, 1.0)
         split_target = 1 + torch.clamp(
             (detail_norm * self.max_gaussians_per_token).long(),
@@ -707,6 +789,8 @@ class GaussianLoss(nn.Module):
             "log_scales": log_scales,
             "rotations": rotations,
             "importance": importance_target,
+            "keep_target": keep_target,
+            "opacity_target": opacity_target,
             "split_target": split_target,
             "sh_target": sh_target,
         }
@@ -723,65 +807,79 @@ class GaussianLoss(nn.Module):
         target = self._prepare_targets(gt)
         patch_valid = target["patch_valid"]
         zero = pred["gaussian_token_means"].new_tensor(0.0)
-
-        if not patch_valid.any():
-            return zero, {
-                "gaussian_center_loss": zero,
-                "gaussian_scale_loss": zero,
-                "gaussian_rotation_loss": zero,
-                "gaussian_opacity_loss": zero,
-                "gaussian_keep_loss": zero,
-                "gaussian_split_loss": zero,
-                "gaussian_sh_loss": zero,
-                "gaussian_offset_reg": zero,
-            }
-
-        center_loss = F.smooth_l1_loss(
-            pred["gaussian_token_means"][patch_valid],
-            target["means"][patch_valid],
-        )
-        scale_loss = F.l1_loss(
-            pred["gaussian_token_log_scales"][patch_valid],
-            target["log_scales"][patch_valid],
-        )
-        rotation_loss = self._rotation_loss(
-            pred["gaussian_token_rotations"],
-            target["rotations"],
-            patch_valid,
-        )
-
-        opacity_logits = pred["gaussian_token_opacity_logits"].squeeze(-1)
-        opacity_target = target["importance"]
-        opacity_loss = F.binary_cross_entropy_with_logits(
-            opacity_logits[patch_valid],
-            opacity_target[patch_valid],
-        )
-
+        center_loss = zero
+        scale_loss = zero
+        rotation_loss = zero
+        opacity_loss = zero
         keep_loss = zero
         split_loss = zero
-        if self.enable_stage1 and "gaussian_keep_logits" in pred:
-            keep_loss = F.binary_cross_entropy_with_logits(
-                pred["gaussian_keep_logits"].squeeze(-1)[patch_valid],
-                opacity_target[patch_valid],
+        sh_loss = zero
+        offset_reg = zero
+        target_keep_ratio = zero
+        target_importance_mean = zero
+        pred_keep_prob_mean = zero
+
+        if patch_valid.any().item():
+            center_loss = F.smooth_l1_loss(
+                pred["gaussian_token_means"][patch_valid],
+                target["means"][patch_valid],
+            )
+            scale_loss = F.l1_loss(
+                pred["gaussian_token_log_scales"][patch_valid],
+                target["log_scales"][patch_valid],
+            )
+            rotation_loss = self._rotation_loss(
+                pred["gaussian_token_rotations"],
+                target["rotations"],
+                patch_valid,
             )
 
-        if self.enable_stage1 and "gaussian_split_logits" in pred:
-            split_logits = pred["gaussian_split_logits"][patch_valid]
-            split_target = target["split_target"][patch_valid] - 1
-            split_loss = F.cross_entropy(split_logits, split_target)
+            opacity_logits = pred["gaussian_token_opacity_logits"].squeeze(-1)
+            keep_target = target["keep_target"]
+            opacity_target = target["opacity_target"]
+            target_keep_ratio = keep_target[patch_valid].float().mean()
+            target_importance_mean = target["importance"][patch_valid].mean()
+            opacity_mask = patch_valid & keep_target
+            if opacity_mask.any().item():
+                opacity_loss = F.binary_cross_entropy_with_logits(
+                    opacity_logits[opacity_mask],
+                    opacity_target[opacity_mask],
+                )
 
-        pred_sh = pred["gaussian_token_sh"][patch_valid]
-        target_sh = target["sh_target"][patch_valid]
-        sh_dc_loss = F.l1_loss(pred_sh[:, 0], target_sh[:, 0])
-        if pred_sh.shape[1] > 1:
-            sh_rest_loss = pred_sh[:, 1:].abs().mean()
-        else:
-            sh_rest_loss = zero
-        sh_loss = sh_dc_loss + 0.1 * sh_rest_loss
+            if self.enable_stage1 and "gaussian_keep_logits" in pred:
+                keep_loss = F.binary_cross_entropy_with_logits(
+                    pred["gaussian_keep_logits"].squeeze(-1)[patch_valid],
+                    keep_target[patch_valid].float(),
+                )
+                if "gaussian_keep_prob" in pred:
+                    pred_keep_prob_mean = pred["gaussian_keep_prob"].squeeze(-1)[patch_valid].mean()
 
-        offset_reg = zero
-        if "gaussian_child_offsets" in pred and pred["gaussian_child_offsets"].numel() > 0:
-            offset_reg = pred["gaussian_child_offsets"][patch_valid].norm(dim=-1).mean()
+            if self.enable_stage1 and "gaussian_split_logits" in pred:
+                split_mask = patch_valid & keep_target
+                if split_mask.any().item():
+                    split_logits = pred["gaussian_split_logits"][split_mask]
+                    split_target = target["split_target"][split_mask] - 1
+                    split_loss = F.cross_entropy(split_logits, split_target)
+
+            pred_sh = pred["gaussian_token_sh"][patch_valid]
+            target_sh = target["sh_target"][patch_valid]
+            sh_loss = F.l1_loss(pred_sh[:, 0], target_sh[:, 0])
+
+            if (
+                "gaussian_child_offsets" in pred
+                and pred["gaussian_child_offsets"].numel() > 0
+            ):
+                offset_reg = pred["gaussian_child_offsets"][patch_valid].norm(dim=-1).mean()
+
+        render_loss = zero
+        render_details = {
+            "gaussian_render_loss": zero,
+            "gaussian_render_rgb_loss": zero,
+            "gaussian_render_depth_loss": zero,
+            "gaussian_render_alpha_loss": zero,
+        }
+        if self.render_loss is not None:
+            render_loss, render_details = self.render_loss(pred, gt)
 
         total_loss = (
             self.center_weight * center_loss
@@ -792,9 +890,10 @@ class GaussianLoss(nn.Module):
             + self.split_weight * split_loss
             + self.sh_weight * sh_loss
             + self.offset_reg_weight * offset_reg
+            + self.render_weight * render_loss
         )
 
-        return total_loss, {
+        details = {
             "gaussian_center_loss": center_loss,
             "gaussian_scale_loss": scale_loss,
             "gaussian_rotation_loss": rotation_loss,
@@ -803,7 +902,12 @@ class GaussianLoss(nn.Module):
             "gaussian_split_loss": split_loss,
             "gaussian_sh_loss": sh_loss,
             "gaussian_offset_reg": offset_reg,
+            "gaussian_target_keep_ratio": target_keep_ratio,
+            "gaussian_target_importance": target_importance_mean,
+            "gaussian_pred_keep_prob": pred_keep_prob_mean,
         }
+        details.update(render_details)
+        return total_loss, details
 
 
 # =============================================================================
@@ -827,6 +931,9 @@ class Loss(nn.Module):
         train_conf: bool = False,
         enable_3dgs: bool = False,
         gaussian_head: Optional[Dict[str, Union[int, float, bool]]] = None,
+        gaussian_render: Optional[Dict[str, object]] = None,
+        point_loss_weight: float = 1.0,
+        camera_loss_weight: float = 0.1,
         gaussian_loss_weight: float = 0.2,
         patch_size: int = 14,
     ):
@@ -834,6 +941,8 @@ class Loss(nn.Module):
         self.point_loss = PointLoss(train_conf=train_conf)
         self.camera_loss = CameraLoss()
         self.enable_3dgs = enable_3dgs
+        self.point_loss_weight = point_loss_weight
+        self.camera_loss_weight = camera_loss_weight
         self.gaussian_loss_weight = gaussian_loss_weight
 
         gaussian_head = gaussian_head or {}
@@ -845,10 +954,57 @@ class Loss(nn.Module):
                 ),
                 sh_degree=gaussian_head.get("sh_degree", 3),
                 enable_stage1=gaussian_head.get("enable_stage1", True),
+                keep_target_threshold=gaussian_head.get("keep_threshold", 0.35),
+                render_config=gaussian_render,
             )
             if enable_3dgs
             else None
         )
+
+    @staticmethod
+    def _compute_norm_factor(
+        local_points: torch.Tensor,
+        masks: torch.Tensor,
+    ) -> torch.Tensor:
+        B = local_points.shape[0]
+        all_pts = local_points.clone()
+        all_pts[~masks] = 0
+        all_pts = all_pts.reshape(B, local_points.shape[1], -1, 3)
+        all_dis = all_pts.norm(dim=-1)
+        denom = masks.float().sum(dim=[-1, -2, -3]).clamp(min=1e-8)
+        return all_dis.sum(dim=[-1, -2]) / denom
+
+    @staticmethod
+    def _transform_points_to_cam0(
+        points: torch.Tensor,
+        camera_poses: torch.Tensor,
+        norm_factor: torch.Tensor,
+    ) -> torch.Tensor:
+        B = points.shape[0]
+        R0 = camera_poses[:, 0, :3, :3]
+        t0 = camera_poses[:, 0, :3, 3]
+        t_w2c = -torch.matmul(t0.unsqueeze(-2), R0).squeeze(-2)
+        rot = R0.view(B, *([1] * (points.dim() - 2)), 3, 3)
+        trans = t_w2c.view(B, *([1] * (points.dim() - 2)), 3)
+        scale = norm_factor.view(B, *([1] * (points.dim() - 1)))
+        return (torch.einsum("...j,...jk->...k", points, rot) + trans) / scale
+
+    def prepare_gaussian_gt(
+        self, gt: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        norm_factor = self._compute_norm_factor(gt["local_points"], gt["valid_masks"])
+        canonical_global_points = self._transform_points_to_cam0(
+            gt["global_points"], gt["camera_poses"], norm_factor
+        )
+        canonical_camera_poses = se3_inverse(gt["camera_poses"][:, :1]) @ gt["camera_poses"]
+        canonical_camera_poses = canonical_camera_poses.clone()
+        canonical_camera_poses[..., :3, 3] /= norm_factor.view(-1, 1, 1)
+
+        gaussian_gt = dict(gt)
+        gaussian_gt["global_points"] = canonical_global_points
+        gaussian_gt["camera_poses"] = canonical_camera_poses
+        gaussian_gt["norm_factors"] = norm_factor
+        return gaussian_gt
     
     def prepare_gt(self, gt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -950,36 +1106,6 @@ class Loss(nn.Module):
             global_points = pred['global_points']
             pred['global_points'] = transform_points_to_cam0(global_points) / scale
 
-        if 'gaussian_token_means' in pred:
-            pred['gaussian_token_means'] = transform_points_to_cam0(
-                pred['gaussian_token_means']
-            ) / expand_like(pred['gaussian_token_means'])
-            pred['gaussian_token_scales'] = (
-                pred['gaussian_token_scales'] / expand_like(pred['gaussian_token_scales'])
-            )
-            pred['gaussian_token_log_scales'] = torch.log(
-                pred['gaussian_token_scales'].clamp_min(1e-6)
-            )
-            pred['gaussian_token_rotations'] = transform_rotations_to_cam0(
-                pred['gaussian_token_rotations']
-            )
-
-        if 'gaussian_child_offsets' in pred:
-            pred['gaussian_child_offsets'] = (
-                pred['gaussian_child_offsets'] / expand_like(pred['gaussian_child_offsets'])
-            )
-
-        if 'gaussian_means' in pred:
-            pred['gaussian_means'] = transform_points_to_cam0(
-                pred['gaussian_means']
-            ) / expand_like(pred['gaussian_means'])
-            pred['gaussian_scales'] = (
-                pred['gaussian_scales'] / expand_like(pred['gaussian_scales'])
-            )
-            pred['gaussian_rotations'] = transform_rotations_to_cam0(
-                pred['gaussian_rotations']
-            )
-
         # Normalize camera translations
         camera_poses_normalized = camera_poses.clone()
         camera_poses_normalized[..., :3, 3] /= norm_factor.view(B, 1, 1)
@@ -1016,23 +1142,28 @@ class Loss(nn.Module):
         """
         # Prepare ground truth
         gt = self.prepare_gt(gt_raw)
-        
-        # Normalize predictions
-        pred = self.normalize_pred(pred, gt)
-        
-        # Compute point and camera losses
-        point_loss, point_details, scale = self.point_loss(pred, gt)
-        cam_loss, cam_details = self.camera_loss(pred, gt, scale)
-        
+        gaussian_gt = self.prepare_gaussian_gt(gt)
+
         gaussian_loss = loss_objective = None
         gaussian_details = {}
         if self.gaussian_loss is not None:
-            gaussian_loss, gaussian_details = self.gaussian_loss(pred, gt)
+            gaussian_loss, gaussian_details = self.gaussian_loss(pred, gaussian_gt)
         else:
-            gaussian_loss = point_loss.new_tensor(0.0)
+            gaussian_loss = gt["global_points"].new_tensor(0.0)
+
+        # Normalize predictions for point/camera supervision only.
+        pred = self.normalize_pred(pred, gt)
+
+        # Compute point and camera losses
+        point_loss, point_details, scale = self.point_loss(pred, gt)
+        cam_loss, cam_details = self.camera_loss(pred, gt, scale)
 
         # Total objective loss
-        loss_objective = point_loss + 0.1 * cam_loss + self.gaussian_loss_weight * gaussian_loss
+        loss_objective = (
+            self.point_loss_weight * point_loss
+            + self.camera_loss_weight * cam_loss
+            + self.gaussian_loss_weight * gaussian_loss
+        )
         
         # Helper to convert to tensor
         def as_tensor(x):
@@ -1077,6 +1208,19 @@ class Loss(nn.Module):
             'loss_gaussian_split': as_tensor(gaussian_details.get('gaussian_split_loss', zero)),
             'loss_gaussian_sh': as_tensor(gaussian_details.get('gaussian_sh_loss', zero)),
             'loss_gaussian_offset_reg': as_tensor(gaussian_details.get('gaussian_offset_reg', zero)),
+            'loss_gaussian_render': as_tensor(gaussian_details.get('gaussian_render_loss', zero)),
+            'loss_gaussian_render_rgb': as_tensor(gaussian_details.get('gaussian_render_rgb_loss', zero)),
+            'loss_gaussian_render_depth': as_tensor(gaussian_details.get('gaussian_render_depth_loss', zero)),
+            'loss_gaussian_render_alpha': as_tensor(gaussian_details.get('gaussian_render_alpha_loss', zero)),
+            'loss_gaussian_target_keep_ratio': as_tensor(gaussian_details.get('gaussian_target_keep_ratio', zero)),
+            'loss_gaussian_target_importance': as_tensor(gaussian_details.get('gaussian_target_importance', zero)),
+            'loss_gaussian_pred_keep_prob': as_tensor(gaussian_details.get('gaussian_pred_keep_prob', zero)),
+            'loss_gaussian_active_count': as_tensor(gaussian_details.get('gaussian_active_count', zero)),
+            'loss_gaussian_active_ratio': as_tensor(gaussian_details.get('gaussian_active_ratio', zero)),
+            'loss_gaussian_mean_opacity': as_tensor(gaussian_details.get('gaussian_mean_opacity', zero)),
+            'loss_gaussian_mean_scale': as_tensor(gaussian_details.get('gaussian_mean_scale', zero)),
+            'loss_gaussian_target_alpha_mean': as_tensor(gaussian_details.get('gaussian_target_alpha_mean', zero)),
+            'loss_gaussian_render_alpha_mean': as_tensor(gaussian_details.get('gaussian_render_alpha_mean', zero)),
         }
         
         return loss_dict

@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 def _standardize_quaternion(quat: torch.Tensor) -> torch.Tensor:
     quat = F.normalize(quat, dim=-1, eps=1e-6)
     return torch.where(quat[..., :1] < 0, -quat, quat)
@@ -151,6 +150,12 @@ class GaussianParameterHead(nn.Module):
         self.opacity_head = nn.Linear(hidden_dim, 1)
         self.sh_head = nn.Linear(hidden_dim, self.num_sh_bases * 3)
         self.offset_head = nn.Linear(hidden_dim, self.num_split_offsets * 3)
+        self.child_log_scale_head = nn.Linear(hidden_dim, self.num_split_offsets * 3)
+        self.child_rotation_head = nn.Linear(hidden_dim, self.num_split_offsets * 4)
+        self.child_opacity_head = nn.Linear(hidden_dim, self.num_split_offsets)
+        self.child_sh_head = nn.Linear(
+            hidden_dim, self.num_split_offsets * self.num_sh_bases * 3
+        )
 
     def forward(
         self,
@@ -178,8 +183,30 @@ class GaussianParameterHead(nn.Module):
             child_offsets = self.offset_head(hidden).view(
                 *hidden.shape[:-1], self.num_split_offsets, 3
             )
+            child_log_scales = self.child_log_scale_head(hidden).view(
+                *hidden.shape[:-1], self.num_split_offsets, 3
+            ).clamp(min=self.log_scale_min, max=self.log_scale_max)
+            child_scales = torch.exp(child_log_scales)
+            child_rotations = _standardize_quaternion(
+                self.child_rotation_head(hidden).view(
+                    *hidden.shape[:-1], self.num_split_offsets, 4
+                )
+            )
+            child_opacity_logits = self.child_opacity_head(hidden).view(
+                *hidden.shape[:-1], self.num_split_offsets, 1
+            )
+            child_opacity = torch.sigmoid(child_opacity_logits)
+            child_sh = self.child_sh_head(hidden).view(
+                *hidden.shape[:-1], self.num_split_offsets, self.num_sh_bases, 3
+            )
         else:
             child_offsets = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
+            child_log_scales = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
+            child_scales = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
+            child_rotations = hidden.new_zeros(*hidden.shape[:-1], 0, 4)
+            child_opacity_logits = hidden.new_zeros(*hidden.shape[:-1], 0, 1)
+            child_opacity = hidden.new_zeros(*hidden.shape[:-1], 0, 1)
+            child_sh = hidden.new_zeros(*hidden.shape[:-1], 0, self.num_sh_bases, 3)
 
         grid_shape = (batch_size, num_frames, patch_h, patch_w)
         means = means.view(*grid_shape, 3)
@@ -192,6 +219,20 @@ class GaussianParameterHead(nn.Module):
         child_offsets = child_offsets.view(
             *grid_shape, self.num_split_offsets, 3
         )
+        child_log_scales = child_log_scales.view(
+            *grid_shape, self.num_split_offsets, 3
+        )
+        child_scales = child_scales.view(*grid_shape, self.num_split_offsets, 3)
+        child_rotations = child_rotations.view(
+            *grid_shape, self.num_split_offsets, 4
+        )
+        child_opacity_logits = child_opacity_logits.view(
+            *grid_shape, self.num_split_offsets, 1
+        )
+        child_opacity = child_opacity.view(*grid_shape, self.num_split_offsets, 1)
+        child_sh = child_sh.view(
+            *grid_shape, self.num_split_offsets, self.num_sh_bases, 3
+        )
 
         return {
             "gaussian_token_means": means,
@@ -202,6 +243,12 @@ class GaussianParameterHead(nn.Module):
             "gaussian_token_opacity": opacity,
             "gaussian_token_sh": sh_coeffs,
             "gaussian_child_offsets": child_offsets,
+            "gaussian_child_log_scales": child_log_scales,
+            "gaussian_child_scales": child_scales,
+            "gaussian_child_rotations": child_rotations,
+            "gaussian_child_opacity_logits": child_opacity_logits,
+            "gaussian_child_opacity": child_opacity,
+            "gaussian_child_sh": child_sh,
         }
 
 
@@ -221,6 +268,10 @@ def assemble_gaussian_outputs(
     opacity = param_outputs["gaussian_token_opacity"]
     sh_coeffs = param_outputs["gaussian_token_sh"]
     child_offsets = param_outputs["gaussian_child_offsets"]
+    child_scales = param_outputs["gaussian_child_scales"]
+    child_rotations = param_outputs["gaussian_child_rotations"]
+    child_opacity = param_outputs["gaussian_child_opacity"]
+    child_sh = param_outputs["gaussian_child_sh"]
 
     batch_size, num_frames, patch_h, patch_w, _ = means.shape
     max_gaussians = child_offsets.shape[-2] + 1
@@ -228,20 +279,17 @@ def assemble_gaussian_outputs(
     zero_offset = torch.zeros_like(means).unsqueeze(-2)
     all_offsets = torch.cat([zero_offset, child_offsets], dim=-2)
     materialized_means = means.unsqueeze(-2) + all_offsets
-    materialized_scales = scales.unsqueeze(-2).expand(
-        batch_size, num_frames, patch_h, patch_w, max_gaussians, 3
+    materialized_scales = torch.cat(
+        [scales.unsqueeze(-2), child_scales], dim=-2
     )
-    materialized_rotations = rotations.unsqueeze(-2).expand(
-        batch_size, num_frames, patch_h, patch_w, max_gaussians, 4
+    materialized_rotations = torch.cat(
+        [rotations.unsqueeze(-2), child_rotations], dim=-2
     )
-    materialized_sh = sh_coeffs.unsqueeze(-3).expand(
-        batch_size,
-        num_frames,
-        patch_h,
-        patch_w,
-        max_gaussians,
-        sh_coeffs.shape[-2],
-        3,
+    materialized_sh = torch.cat(
+        [sh_coeffs.unsqueeze(-3), child_sh], dim=-3
+    )
+    materialized_opacity = torch.cat(
+        [opacity.unsqueeze(-2), child_opacity], dim=-2
     )
 
     if use_stage1:
@@ -262,13 +310,7 @@ def assemble_gaussian_outputs(
             keep_prob.squeeze(-1).unsqueeze(-1) >= float(keep_threshold)
         )
 
-    opacity_mass = opacity * keep_prob
-    opacity_mass = opacity_mass / split_count.unsqueeze(-1).clamp(min=1).to(
-        opacity_mass.dtype
-    )
-    materialized_opacity = opacity_mass.unsqueeze(-2).expand(
-        batch_size, num_frames, patch_h, patch_w, max_gaussians, 1
-    )
+    materialized_opacity = materialized_opacity * keep_prob.unsqueeze(-2)
     materialized_opacity = materialized_opacity * active_mask.unsqueeze(-1).to(
         materialized_opacity.dtype
     )

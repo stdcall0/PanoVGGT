@@ -109,6 +109,20 @@ logging:
         - loss_gaussian_keep
         - loss_gaussian_split
         - loss_gaussian_sh
+        - loss_gaussian_offset_reg
+        - loss_gaussian_render
+        - loss_gaussian_render_rgb
+        - loss_gaussian_render_depth
+        - loss_gaussian_render_alpha
+        - loss_gaussian_target_keep_ratio
+        - loss_gaussian_target_importance
+        - loss_gaussian_pred_keep_prob
+        - loss_gaussian_active_count
+        - loss_gaussian_active_ratio
+        - loss_gaussian_mean_opacity
+        - loss_gaussian_mean_scale
+        - loss_gaussian_target_alpha_mean
+        - loss_gaussian_render_alpha_mean
     val:
       keys_to_log:
         - loss_objective
@@ -127,11 +141,26 @@ logging:
         - loss_gaussian_keep
         - loss_gaussian_split
         - loss_gaussian_sh
+        - loss_gaussian_offset_reg
+        - loss_gaussian_render
+        - loss_gaussian_render_rgb
+        - loss_gaussian_render_depth
+        - loss_gaussian_render_alpha
+        - loss_gaussian_target_keep_ratio
+        - loss_gaussian_target_importance
+        - loss_gaussian_pred_keep_prob
+        - loss_gaussian_active_count
+        - loss_gaussian_active_ratio
+        - loss_gaussian_mean_opacity
+        - loss_gaussian_mean_scale
+        - loss_gaussian_target_alpha_mean
+        - loss_gaussian_render_alpha_mean
 
 
 checkpoint:
   save_dir: /public/home/v-guoyj/workspace/panopd/logs/${exp_name}/ckpts
   save_freq: 5
+  init_checkpoint_path: null
   resume_checkpoint_path: null
   strict: False
 
@@ -141,6 +170,18 @@ loss:
   train_conf: ${model.train_conf}
   enable_3dgs: ${model.enable_3dgs}
   gaussian_head: ${model.gaussian_head}
+  gaussian_render:
+    enabled: True
+    weight: 1.0
+    cube_dim: 64
+    face_indices: [0, 1, 2, 3, 4, 5]
+    rgb_weight: 1.0
+    depth_weight: 0.15
+    alpha_weight: 0.1
+    opacity_floor: 1e-4
+    fov_degrees: 90.0
+  point_loss_weight: 1.0
+  camera_loss_weight: 0.1
   gaussian_loss_weight: 0.2
   patch_size: ${patch_size}
 

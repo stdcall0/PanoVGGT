@@ -1,0 +1,51 @@
+defaults:
+  - gaussian_only
+  - _self_
+
+exp_name: panocity_partial_gaussian_v2_base
+num_workers: 4
+max_img_per_gpu: 48
+max_img_per_gpu_val: 48
+val_epoch_freq: 1
+
+logging:
+  log_dir: /home/featurize/PanoVGGTv2/outputs
+
+checkpoint:
+  save_dir: ${logging.log_dir}/${exp_name}/ckpts
+  init_checkpoint_path: /home/featurize/checkpoints/model.pt
+  save_freq: 1
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.panocity.PanoCityDataset
+          split: train
+          PanoCity_DIR: /home/featurize/PanoCity
+          splits_config_file: splits_config.json
+          len_train: 4000
+          get_nearby: True
+
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu_val}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.panocity.PanoCityDataset
+          split: test
+          PanoCity_DIR: /home/featurize/PanoCity
+          splits_config_file: splits_config.json
+          len_test: 256

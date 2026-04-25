@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from typing import Callable, Optional
+import math
 
 from hydra.utils import instantiate
 import random
@@ -223,8 +224,14 @@ class DynamicBatchSampler(Sampler):
                 break  # End of sampler's iterator
 
     def __len__(self):
-        # Return a large dummy length
-        return 1000000
+        # Estimate batches/epoch from the sampler size and expected dynamic batch size.
+        if len(self.possible_nums) == 0:
+            return len(self.sampler)
+
+        batch_sizes = np.floor(self.max_img_per_gpu / self.possible_nums).astype(int)
+        batch_sizes = np.clip(batch_sizes, 1, None)
+        expected_batch_size = float(np.sum(self.normalized_weights * batch_sizes))
+        return max(1, int(math.ceil(len(self.sampler) / max(expected_batch_size, 1.0))))
 
 
 class DynamicDistributedSampler(DistributedSampler):

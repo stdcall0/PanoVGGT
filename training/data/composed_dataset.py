@@ -14,8 +14,12 @@ from torch.utils.data import Dataset
 from torch.utils.data import ConcatDataset
 import bisect
 from .dataset_util import *
-from .track_util import *
 from .augmentation import PanoAugmentation
+
+try:
+    from .track_util import build_tracks_by_depth_pano
+except ModuleNotFoundError:
+    build_tracks_by_depth_pano = None
 
 
 class ComposedDataset(Dataset, ABC):
@@ -122,6 +126,10 @@ class ComposedDataset(Dataset, ABC):
 
             else:
                 # Generate tracks on-the-fly using the final processed Tensors.
+                if build_tracks_by_depth_pano is None:
+                    raise ImportError(
+                        "training.data.track_util is required when load_track=True."
+                    )
                 tracks, track_vis_mask, track_positive_mask = build_tracks_by_depth_pano(
                     sample["extrinsics"],
                     sample["world_points"],
