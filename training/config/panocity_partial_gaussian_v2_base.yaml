@@ -9,11 +9,11 @@ max_img_per_gpu_val: 48
 val_epoch_freq: 1
 
 logging:
-  log_dir: /home/featurize/PanoVGGTv2/outputs
+  log_dir: /home/featurize/PanoVGGT/outputs
 
 checkpoint:
   save_dir: ${logging.log_dir}/${exp_name}/ckpts
-  init_checkpoint_path: /home/featurize/checkpoints/model.pt
+  init_checkpoint_path: /home/featurize/PanoVGGT/checkpoints/model.pt
   save_freq: 1
 
 data:
@@ -30,7 +30,8 @@ data:
         - _target_: data.datasets.panocity.PanoCityDataset
           split: train
           PanoCity_DIR: /home/featurize/PanoCity
-          splits_config_file: splits_config.json
+          splits_config_file: /home/featurize/PanoVGGT/outputs/panocity_splits/splits_config.json
+          cache_dir: /home/featurize/PanoVGGT/outputs/panocity_cache
           len_train: 4000
           get_nearby: True
 
@@ -47,5 +48,6 @@ data:
         - _target_: data.datasets.panocity.PanoCityDataset
           split: test
           PanoCity_DIR: /home/featurize/PanoCity
-          splits_config_file: splits_config.json
+          splits_config_file: /home/featurize/PanoVGGT/outputs/panocity_splits/splits_config.json
+          cache_dir: /home/featurize/PanoVGGT/outputs/panocity_cache
           len_test: 256

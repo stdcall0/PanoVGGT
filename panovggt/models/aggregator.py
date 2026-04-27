@@ -12,7 +12,11 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
-import requests
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 from panovggt.dinov2.layers import Mlp, PatchEmbed
 from panovggt.layers.pos_embed import RoPE2D, PositionGetter
@@ -186,6 +190,10 @@ class Aggregator(nn.Module):
 
     def _try_load_dinov2(self, hub_name: str, url: Optional[str], patch_embed_key: str):
         """Try loading DINOv2 weights via torch.hub, then fallback to direct download."""
+        if os.environ.get("PANOVGGT_SKIP_DINOV2_DOWNLOAD") == "1":
+            logger.info("Skipping DINOv2 preload because PANOVGGT_SKIP_DINOV2_DOWNLOAD=1")
+            return
+
         success = False
         model_dict = self.patch_embed.state_dict()
 
@@ -212,7 +220,10 @@ class Aggregator(nn.Module):
                 weights_dir.mkdir(parents=True, exist_ok=True)
                 local_path = weights_dir / f"{patch_embed_key}_pretrain.pth"
                 if not local_path.exists():
-                    r = requests.get(url, allow_redirects=True)
+                    if requests is None:
+                        raise RuntimeError("requests is not installed")
+                    r = requests.get(url, allow_redirects=True, timeout=60)
+                    r.raise_for_status()
                     with open(local_path, "wb") as f:
                         f.write(r.content)
                 state = torch.load(local_path, map_location="cpu")

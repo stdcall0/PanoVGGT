@@ -29,6 +29,7 @@ class PanoCityDataset(BaseDataset):
             split: str = "train",
             PanoCity_DIR: str = "/data/dataset/panorama/panocity",
             splits_config_file: str = "splits_config.json",
+            cache_dir: str = None,
             min_num_images: int = 2,
             len_train: int = 100000,
             len_test: int = 10000,
@@ -53,6 +54,7 @@ class PanoCityDataset(BaseDataset):
         self.expand_ratio = expand_ratio
         self.PanoCity_DIR = PanoCity_DIR
         self.splits_config_file = splits_config_file
+        self.cache_dir = cache_dir or osp.join(self.PanoCity_DIR, "cache")
         self.min_num_images = min_num_images
         self.split = split
         self.split_seed = int(split_seed)
@@ -104,9 +106,8 @@ class PanoCityDataset(BaseDataset):
     # ------------------------- cache / indexing -------------------------
     def _load_splits_cache(self):
         """Load split index from cache, or build once and cache it."""
-        cache_dir = osp.join(self.PanoCity_DIR, "cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_path = osp.join(cache_dir, f"PanoCity_{self.mode}_index.json")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        cache_path = osp.join(self.cache_dir, f"PanoCity_{self.mode}_index.json")
 
         def build_fn():
             return self._build_index_json()
@@ -119,9 +120,8 @@ class PanoCityDataset(BaseDataset):
     
     def _split_indices_path(self):
         """Return the cache path for deterministic split indices."""
-        cache_dir = osp.join(self.PanoCity_DIR, "cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        return osp.join(cache_dir, f"fixed_split_indices_seed{self.split_seed}.json")
+        os.makedirs(self.cache_dir, exist_ok=True)
+        return osp.join(self.cache_dir, f"fixed_split_indices_seed{self.split_seed}.json")
 
     def _load_fixed_split_indices(self):
         """Load fixed split indices from disk; return None if missing/invalid."""
@@ -160,9 +160,12 @@ class PanoCityDataset(BaseDataset):
         if data is not None:
             
             if int(data.get("n_total", -1)) != n_total:
-                logging.warning(f"[SplitFixed] n_total changed ({data['n_total']} -> {n_total}). "
-                                f"Still using existing fixed split as requested.")
-            return data
+                logging.warning(
+                    f"[SplitFixed] n_total changed ({data['n_total']} -> {n_total}). "
+                    f"Rebuilding fixed split with seed {self.split_seed}."
+                )
+            else:
+                return data
 
         
         rng = random.Random(self.split_seed)
@@ -191,7 +194,9 @@ class PanoCityDataset(BaseDataset):
     # ------------------------- index build -------------------------
     def _build_index_json(self):
         """Build trajectory index records as list[dict]."""
-        splits_path = osp.join(self.PanoCity_DIR, self.splits_config_file)
+        splits_path = self.splits_config_file
+        if not osp.isabs(splits_path):
+            splits_path = osp.join(self.PanoCity_DIR, splits_path)
         if not osp.exists(splits_path):
             raise ValueError(f"Splits config file not found at {splits_path}")
         with open(splits_path, 'r') as f:

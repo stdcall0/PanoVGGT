@@ -53,3 +53,6 @@ skyseg.onnx
 .DS_Store
 
 work/
+.codex
+3dgs/
+checkpoints/

@@ -59,7 +59,8 @@ def _balanced_soft_bce(
         weight = balance * confidence
         weight = weight / weight.mean().clamp_min(1e-6)
 
-    return F.binary_cross_entropy(pred, target, weight=weight)
+    pred_logits = torch.logit(pred)
+    return F.binary_cross_entropy_with_logits(pred_logits, target, weight=weight)
 
 
 class GaussianCubemapRenderLoss(nn.Module):
