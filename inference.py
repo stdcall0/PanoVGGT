@@ -30,6 +30,7 @@ from panovggt.utils.gaussian import (
     gaussian_keys_in,
     save_gaussian_centers_ply,
     save_gaussian_predictions,
+    save_gaussian_splat_ply,
 )
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
@@ -285,6 +286,9 @@ def save_gaussian_artifacts(predictions: dict, output_dir: str) -> Optional[str]
 
     save_gaussian_centers_ply(
         os.path.join(gaussian_dir, "gaussian_centers.ply"), flattened
+    )
+    save_gaussian_splat_ply(
+        os.path.join(gaussian_dir, "gaussians.ply"), flattened
     )
     print(
         f"[pipeline] Gaussian artifacts saved ({len(flattened['means']):,} splats) -> {gaussian_dir}"

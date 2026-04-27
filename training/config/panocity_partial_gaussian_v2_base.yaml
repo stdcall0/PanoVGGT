@@ -16,6 +16,27 @@ checkpoint:
   init_checkpoint_path: /home/featurize/PanoVGGT/checkpoints/model.pt
   save_freq: 1
 
+loss:
+  gaussian_render:
+    weight: 2.0
+    depth_weight: 0.10
+    alpha_weight: 0.05
+    opacity_floor: 1e-3
+    sh_warmup_start: 0.0
+    sh_warmup_end: 0.35
+  gaussian_supervision:
+    center_weight: 0.20
+    scale_weight: 0.03
+    rotation_weight: 0.02
+    opacity_weight: 0.02
+    keep_weight: 0.01
+    split_weight: 0.01
+    sh_weight: 0.03
+    sh_rest_reg_weight: 0.002
+    sh_rest_warmup_start: 0.0
+    sh_rest_warmup_end: 0.35
+    offset_reg_weight: 0.002
+
 data:
   train:
     _target_: data.dynamic_dataloader.DynamicTorchDataset

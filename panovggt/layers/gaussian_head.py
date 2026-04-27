@@ -5,6 +5,7 @@ The implementation stays on the patch lattice to keep memory bounded while still
 supporting adaptive densification through per-token split offsets.
 """
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -54,6 +55,18 @@ class GaussianStage1Head(nn.Module):
         self.split_head = _TokenMLP(
             in_dim, hidden_dim, max_gaussians_per_token
         )
+        self._init_parameters()
+
+    @staticmethod
+    def _init_linear(linear: nn.Linear, std: float = 1e-3, bias: float = 0.0) -> None:
+        nn.init.normal_(linear.weight, mean=0.0, std=std)
+        nn.init.constant_(linear.bias, bias)
+
+    def _init_parameters(self) -> None:
+        self._init_linear(self.keep_head.net[-1], std=1e-3, bias=1.5)
+        self._init_linear(self.split_head.net[-1], std=1e-3, bias=0.0)
+        with torch.no_grad():
+            self.split_head.net[-1].bias[0] = 3.0
 
     def forward(
         self,
@@ -156,6 +169,35 @@ class GaussianParameterHead(nn.Module):
         self.child_sh_head = nn.Linear(
             hidden_dim, self.num_split_offsets * self.num_sh_bases * 3
         )
+        self._init_parameters()
+
+    @staticmethod
+    def _logit(p: float) -> float:
+        p = min(max(p, 1e-6), 1.0 - 1e-6)
+        return math.log(p / (1.0 - p))
+
+    @staticmethod
+    def _init_linear(linear: nn.Linear, std: float = 1e-3, bias: float = 0.0) -> None:
+        nn.init.normal_(linear.weight, mean=0.0, std=std)
+        nn.init.constant_(linear.bias, bias)
+
+    def _init_parameters(self) -> None:
+        self._init_linear(self.mean_head, std=1e-3, bias=0.0)
+        self._init_linear(self.log_scale_head, std=1e-3, bias=-2.3)
+        self._init_linear(self.rotation_head, std=1e-3, bias=0.0)
+        self._init_linear(self.opacity_head, std=1e-3, bias=self._logit(0.05))
+        self._init_linear(self.sh_head, std=1e-3, bias=0.0)
+        self._init_linear(self.offset_head, std=1e-3, bias=0.0)
+        self._init_linear(self.child_log_scale_head, std=1e-3, bias=-2.8)
+        self._init_linear(self.child_rotation_head, std=1e-3, bias=0.0)
+        self._init_linear(
+            self.child_opacity_head, std=1e-3, bias=self._logit(0.02)
+        )
+        self._init_linear(self.child_sh_head, std=1e-3, bias=0.0)
+        with torch.no_grad():
+            self.rotation_head.bias[0] = 1.0
+            for child_idx in range(self.num_split_offsets):
+                self.child_rotation_head.bias[child_idx * 4] = 1.0
 
     def forward(
         self,
@@ -257,6 +299,8 @@ def assemble_gaussian_outputs(
     param_outputs: Dict[str, torch.Tensor],
     keep_threshold: Optional[float] = None,
     use_stage1: bool = True,
+    soft_split: bool = False,
+    min_active_prob: float = 1e-4,
 ) -> Dict[str, torch.Tensor]:
     """
     Materialize per-token Gaussian parameters into a fixed maximum number of slots.
@@ -295,22 +339,36 @@ def assemble_gaussian_outputs(
     if use_stage1:
         keep_prob = stage1_outputs["gaussian_keep_prob"]
         split_count = stage1_outputs["gaussian_split_count"]
+        split_prob = stage1_outputs["gaussian_split_prob"]
     else:
         keep_prob = torch.ones_like(opacity)
         split_count = torch.ones_like(
             stage1_outputs["gaussian_split_count"], dtype=torch.long
         )
+        split_prob = None
 
     slot_ids = torch.arange(max_gaussians, device=means.device).view(
         1, 1, 1, 1, max_gaussians
     )
-    active_mask = slot_ids < split_count.unsqueeze(-1)
+    hard_active_mask = slot_ids < split_count.unsqueeze(-1)
+
+    if use_stage1 and soft_split and split_prob is not None:
+        split_slot_weight = torch.flip(
+            torch.cumsum(torch.flip(split_prob, dims=[-1]), dim=-1),
+            dims=[-1],
+        ).clamp_(0.0, 1.0)
+        active_mask = split_slot_weight > float(min_active_prob)
+    else:
+        split_slot_weight = hard_active_mask.to(materialized_opacity.dtype)
+        active_mask = hard_active_mask
+
     if keep_threshold is not None:
-        active_mask = active_mask & (
-            keep_prob.squeeze(-1).unsqueeze(-1) >= float(keep_threshold)
-        )
+        keep_mask = keep_prob.squeeze(-1).unsqueeze(-1) >= float(keep_threshold)
+        active_mask = active_mask & keep_mask
+        split_slot_weight = split_slot_weight * keep_mask.to(split_slot_weight.dtype)
 
     materialized_opacity = materialized_opacity * keep_prob.unsqueeze(-2)
+    materialized_opacity = materialized_opacity * split_slot_weight.unsqueeze(-1)
     materialized_opacity = materialized_opacity * active_mask.unsqueeze(-1).to(
         materialized_opacity.dtype
     )

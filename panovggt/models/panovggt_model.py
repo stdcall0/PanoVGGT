@@ -131,6 +131,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
     DEFAULT_GAUSSIAN_HEAD_CONFIG = {
         "enable_stage1": True,
         "keep_threshold": 0.35,
+        "anchor_frame": "first",
         "max_gaussians_per_token": 4,
         "sh_degree": 3,
         "dec_embed_dim": 1024,
@@ -225,6 +226,9 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             )
             self.gaussian_keep_threshold = float(
                 gaussian_head.get("keep_threshold", 0.35)
+            )
+            self.gaussian_anchor_frame = str(
+                gaussian_head.get("anchor_frame", "first")
             )
             self.gaussian_decoder = ContextTransformerDecoder(
                 in_dim=in_dim_for_decoders,
@@ -341,23 +345,33 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         return self._direction_vectors_cache
 
     def _build_anchor_context(
-        self, tokens: torch.Tensor, batch_size: int, num_frames: int
+        self,
+        tokens: torch.Tensor,
+        batch_size: int,
+        num_frames: int,
+        anchor_frame: str,
     ) -> torch.Tensor:
         _, num_tokens, channels = tokens.shape
         tokens_4d = tokens.reshape(batch_size, num_frames, num_tokens, channels)
 
-        if self.training:
+        if anchor_frame == "random":
             anchor_idx = torch.randint(0, num_frames, (batch_size,), device=tokens.device)
-            context = (
-                tokens_4d[torch.arange(batch_size, device=tokens.device), anchor_idx]
-                .unsqueeze(1)
-                .expand(batch_size, num_frames, num_tokens, channels)
+        elif anchor_frame == "first":
+            anchor_idx = torch.zeros(batch_size, device=tokens.device, dtype=torch.long)
+        elif anchor_frame == "mid":
+            anchor_idx = torch.full(
+                (batch_size,),
+                num_frames // 2,
+                device=tokens.device,
+                dtype=torch.long,
             )
         else:
-            mid_idx = num_frames // 2
-            context = tokens_4d[:, mid_idx : mid_idx + 1].expand(
-                batch_size, num_frames, num_tokens, channels
-            )
+            raise ValueError(f"Unsupported anchor_frame='{anchor_frame}'")
+        context = (
+            tokens_4d[torch.arange(batch_size, device=tokens.device), anchor_idx]
+            .unsqueeze(1)
+            .expand(batch_size, num_frames, num_tokens, channels)
+        )
         return context.reshape(batch_size * num_frames, num_tokens, channels)
 
     def forward(self, images: torch.Tensor, query_points: torch.Tensor = None):
@@ -439,9 +453,23 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points"] = world
                 predictions["points"] = world
 
-        context = None
-        if self.enable_global_points or self.enable_3dgs:
-            context = self._build_anchor_context(tokens, B, S)
+        global_context = None
+        if self.enable_global_points:
+            global_context = self._build_anchor_context(
+                tokens,
+                B,
+                S,
+                anchor_frame="random" if self.training else "mid",
+            )
+
+        gaussian_context = None
+        if self.enable_3dgs:
+            gaussian_context = self._build_anchor_context(
+                tokens,
+                B,
+                S,
+                anchor_frame=self.gaussian_anchor_frame,
+            )
 
         # --- Global points branch ---
         if self.enable_global_points:
@@ -450,7 +478,11 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 tokens.device, tokens.dtype, "global", B * S,
             )
             global_point_hidden = self.global_points_decoder(
-                tokens, context, pos_embed=pos_bs_global, xpos=pos_2d, ypos=pos_2d,
+                tokens,
+                global_context,
+                pos_embed=pos_bs_global,
+                xpos=pos_2d,
+                ypos=pos_2d,
             )
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 global_point_hidden = global_point_hidden.float()
@@ -474,7 +506,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             )
             gaussian_hidden = self.gaussian_decoder(
                 tokens,
-                context,
+                gaussian_context,
                 pos_embed=pos_bs_gaussian,
                 xpos=pos_2d,
                 ypos=pos_2d,
@@ -504,6 +536,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                         self.gaussian_keep_threshold if not self.training else None
                     ),
                     use_stage1=self.gaussian_stage1_enabled,
+                    soft_split=self.training,
                 )
 
             predictions.update(stage1_outputs)

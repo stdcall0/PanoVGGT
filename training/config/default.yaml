@@ -109,6 +109,9 @@ logging:
         - loss_gaussian_keep
         - loss_gaussian_split
         - loss_gaussian_sh
+        - loss_gaussian_sh_dc
+        - loss_gaussian_sh_rest_reg
+        - loss_gaussian_sh_high_order_scale
         - loss_gaussian_offset_reg
         - loss_gaussian_render
         - loss_gaussian_render_rgb
@@ -141,6 +144,9 @@ logging:
         - loss_gaussian_keep
         - loss_gaussian_split
         - loss_gaussian_sh
+        - loss_gaussian_sh_dc
+        - loss_gaussian_sh_rest_reg
+        - loss_gaussian_sh_high_order_scale
         - loss_gaussian_offset_reg
         - loss_gaussian_render
         - loss_gaussian_render_rgb

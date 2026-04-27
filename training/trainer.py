@@ -460,6 +460,7 @@ class Trainer:
 
         iters_per_epoch = len(val_loader)
         limit_val_batches = iters_per_epoch if self.limit_val_batches is None else self.limit_val_batches
+        progress_denom = max(self.max_epochs - 1, 1)
 
         for data_iter, batch in enumerate(val_loader):
             if data_iter > limit_val_batches:
@@ -470,6 +471,10 @@ class Trainer:
 
             with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
+            batch["gaussian_progress"] = min(
+                (self.epoch + float(data_iter) / max(limit_val_batches, 1)) / progress_denom,
+                1.0,
+            )
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
             amp_type = self.optim_conf.amp.amp_dtype
@@ -519,6 +524,7 @@ class Trainer:
 
         iters_per_epoch = len(train_loader)
         limit_train_batches = iters_per_epoch if self.limit_train_batches is None else self.limit_train_batches
+        progress_denom = max(self.max_epochs - 1, 1)
 
         if self.gradient_clipper is not None:
             self.gradient_clipper.setup_clipping(self.model)
@@ -532,6 +538,10 @@ class Trainer:
 
             with torch.amp.autocast('cuda', enabled=False):
                 batch = self._process_batch(batch)
+            batch["gaussian_progress"] = min(
+                (self.epoch + float(data_iter) / max(limit_train_batches, 1)) / progress_denom,
+                1.0,
+            )
             batch = copy_data_to_device(batch, self.device, non_blocking=True)
 
             # from training.train_utils.debug_vis_batch import save_batch_visualization

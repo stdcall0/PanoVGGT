@@ -76,6 +76,8 @@ class GaussianCubemapRenderLoss(nn.Module):
         opacity_floor: float = 1e-4,
         fov_degrees: float = 90.0,
         sh_degree: int = 3,
+        sh_warmup_start: float = 0.0,
+        sh_warmup_end: float = 0.35,
     ):
         super().__init__()
         self.cube_dim = int(cube_dim)
@@ -86,6 +88,8 @@ class GaussianCubemapRenderLoss(nn.Module):
         self.opacity_floor = float(opacity_floor)
         self.fov_degrees = float(fov_degrees)
         self.sh_degree = int(sh_degree)
+        self.sh_warmup_start = float(sh_warmup_start)
+        self.sh_warmup_end = float(sh_warmup_end)
 
         face_rotations = torch.tensor(
             [
@@ -101,6 +105,21 @@ class GaussianCubemapRenderLoss(nn.Module):
         self.register_buffer("_face_rotations", face_rotations, persistent=False)
         self._cubemap_projectors = nn.ModuleDict()
         self._warned_missing_gsplat = False
+
+    def _high_order_scale(self, progress: object) -> float:
+        if isinstance(progress, torch.Tensor):
+            progress = float(progress.detach().float().mean().item())
+        elif progress is None:
+            progress = 1.0
+        else:
+            progress = float(progress)
+
+        if self.sh_warmup_end <= self.sh_warmup_start:
+            return 1.0
+        scale = (progress - self.sh_warmup_start) / (
+            self.sh_warmup_end - self.sh_warmup_start
+        )
+        return float(max(0.0, min(1.0, scale)))
 
     def _get_rasterization(self):
         bootstrap_gsplat_runtime(preload_runtime_libs=False)
@@ -197,6 +216,7 @@ class GaussianCubemapRenderLoss(nn.Module):
         self,
         pred: Dict[str, torch.Tensor],
         batch_idx: int,
+        high_order_scale: float = 1.0,
     ) -> Optional[Dict[str, torch.Tensor]]:
         means = pred["gaussian_means"][batch_idx].reshape(-1, 3)
         scales = pred["gaussian_scales"][batch_idx].reshape(-1, 3)
@@ -222,8 +242,10 @@ class GaussianCubemapRenderLoss(nn.Module):
         scales = scales[keep].clamp_min(1e-5)
         rotations = F.normalize(rotations[keep], dim=-1, eps=1e-6)
         opacities = opacity_scalar[keep].clamp(1e-5, 1.0 - 1e-5)
-        sh_coeffs = sh[keep].clone()
-        sh_coeffs[..., 0, :] = (sh_coeffs[..., 0, :] - 0.5) / GSPLAT_SH_C0
+        sh_coeffs = sh[keep]
+        if sh_coeffs.shape[-2] > 1 and high_order_scale < 1.0:
+            sh_coeffs = sh_coeffs.clone()
+            sh_coeffs[..., 1:, :] *= high_order_scale
         return {
             "means": means,
             "scales": scales,
@@ -282,6 +304,7 @@ class GaussianCubemapRenderLoss(nn.Module):
                 "gaussian_mean_scale": zero,
                 "gaussian_target_alpha_mean": zero,
                 "gaussian_render_alpha_mean": zero,
+                "gaussian_sh_high_order_scale": zero,
             }
 
         frame_indices = torch.arange(
@@ -299,10 +322,12 @@ class GaussianCubemapRenderLoss(nn.Module):
                 "gaussian_mean_scale": zero,
                 "gaussian_target_alpha_mean": zero,
                 "gaussian_render_alpha_mean": zero,
+                "gaussian_sh_high_order_scale": zero,
             }
         target_rgb, target_depth, target_alpha, target_support = self._prepare_targets(
             gt, frame_indices
         )
+        high_order_scale = self._high_order_scale(gt.get("gaussian_progress", 1.0))
 
         rgb_terms = []
         depth_terms = []
@@ -315,7 +340,9 @@ class GaussianCubemapRenderLoss(nn.Module):
         render_alpha_means = []
 
         for batch_idx in range(gt["imgs"].shape[0]):
-            gaussian_pack = self._flatten_batch_gaussians(pred, batch_idx)
+            gaussian_pack = self._flatten_batch_gaussians(
+                pred, batch_idx, high_order_scale=high_order_scale
+            )
             if gaussian_pack is None:
                 continue
 
@@ -380,6 +407,7 @@ class GaussianCubemapRenderLoss(nn.Module):
                 "gaussian_mean_scale": zero,
                 "gaussian_target_alpha_mean": zero,
                 "gaussian_render_alpha_mean": zero,
+                "gaussian_sh_high_order_scale": zero.new_tensor(high_order_scale),
             }
 
         rgb_loss = torch.stack(rgb_terms).mean()
@@ -407,4 +435,5 @@ class GaussianCubemapRenderLoss(nn.Module):
             "gaussian_mean_scale": mean_scale,
             "gaussian_target_alpha_mean": target_alpha_mean,
             "gaussian_render_alpha_mean": render_alpha_mean,
+            "gaussian_sh_high_order_scale": zero.new_tensor(high_order_scale),
         }

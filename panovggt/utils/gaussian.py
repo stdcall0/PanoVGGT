@@ -8,6 +8,8 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 
+GSPLAT_SH_C0 = 0.28209479177387814
+
 
 GAUSSIAN_PREDICTION_KEYS = {
     "gaussian_keep_logits",
@@ -114,6 +116,8 @@ def flatten_gaussian_predictions(
 
     if "gaussian_keep_prob" in predictions:
         keep_prob = _to_numpy(predictions["gaussian_keep_prob"]).squeeze(-1)
+        if keep_prob.ndim == 3:
+            keep_prob = keep_prob[None]
         flat["keep_prob"] = keep_prob[batch_idx, frame_idx, patch_row, patch_col].astype(
             np.float32
         )
@@ -148,7 +152,7 @@ def gaussian_color_from_sh(flattened: Dict[str, np.ndarray]) -> np.ndarray:
     sh = flattened.get("sh")
     if sh is None or sh.size == 0:
         return np.zeros((0, 3), dtype=np.uint8)
-    rgb = np.clip(sh[:, 0], 0.0, 1.0)
+    rgb = np.clip(sh[:, 0] * GSPLAT_SH_C0 + 0.5, 0.0, 1.0)
     return (rgb * 255.0).astype(np.uint8)
 
 
@@ -198,4 +202,141 @@ def save_gaussian_centers_ply(
         data["r"] = rgb[:, 0] if len(rgb) else 0
         data["g"] = rgb[:, 1] if len(rgb) else 0
         data["b"] = rgb[:, 2] if len(rgb) else 0
+        f.write(data.tobytes())
+
+
+def _inverse_sigmoid(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    x = np.clip(x, eps, 1.0 - eps)
+    return np.log(x / (1.0 - x))
+
+
+def save_gaussian_splat_ply(
+    output_path: str,
+    flattened: Dict[str, np.ndarray],
+) -> None:
+    """
+    Save Gaussians in the de-facto standard 3DGS PLY layout used by common
+    Gaussian Splat viewers.
+
+    The exported properties follow the usual GraphDECO-compatible schema:
+    xyz, dummy normals, SH DC / SH rest, opacity (logit), log-scales, rotation.
+    """
+    xyz = flattened.get("means")
+    scales = flattened.get("scales")
+    rotations = flattened.get("rotations")
+    opacity = flattened.get("opacity")
+    sh = flattened.get("sh")
+
+    if any(v is None for v in (xyz, scales, rotations, opacity, sh)):
+        return
+
+    xyz = np.asarray(xyz, dtype=np.float32)
+    scales = np.asarray(scales, dtype=np.float32)
+    rotations = np.asarray(rotations, dtype=np.float32)
+    opacity = np.asarray(opacity, dtype=np.float32).reshape(-1, 1)
+    sh = np.asarray(sh, dtype=np.float32)
+
+    num_points = xyz.shape[0]
+    if num_points == 0:
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("wb") as f:
+            header = (
+                "ply\n"
+                "format binary_little_endian 1.0\n"
+                "element vertex 0\n"
+                "property float x\n"
+                "property float y\n"
+                "property float z\n"
+                "property float nx\n"
+                "property float ny\n"
+                "property float nz\n"
+                "property float f_dc_0\n"
+                "property float f_dc_1\n"
+                "property float f_dc_2\n"
+                "property float opacity\n"
+                "property float scale_0\n"
+                "property float scale_1\n"
+                "property float scale_2\n"
+                "property float rot_0\n"
+                "property float rot_1\n"
+                "property float rot_2\n"
+                "property float rot_3\n"
+                "end_header\n"
+            )
+            f.write(header.encode("ascii"))
+        return
+
+    if sh.ndim != 3 or sh.shape[-1] != 3:
+        raise ValueError(f"Expected SH array of shape (N, C, 3), got {sh.shape}")
+
+    normals = np.zeros_like(xyz, dtype=np.float32)
+    f_dc = sh[:, 0, :].astype(np.float32)
+    f_rest = sh[:, 1:, :].reshape(num_points, -1).astype(np.float32)
+    opacity_logit = _inverse_sigmoid(opacity).astype(np.float32)
+    log_scales = np.log(np.clip(scales, 1e-8, None)).astype(np.float32)
+
+    rot_norm = np.linalg.norm(rotations, axis=1, keepdims=True)
+    rotations = rotations / np.clip(rot_norm, 1e-8, None)
+
+    dtype_fields = [
+        ("x", np.float32),
+        ("y", np.float32),
+        ("z", np.float32),
+        ("nx", np.float32),
+        ("ny", np.float32),
+        ("nz", np.float32),
+        ("f_dc_0", np.float32),
+        ("f_dc_1", np.float32),
+        ("f_dc_2", np.float32),
+    ]
+    dtype_fields.extend((f"f_rest_{i}", np.float32) for i in range(f_rest.shape[1]))
+    dtype_fields.extend(
+        [
+            ("opacity", np.float32),
+            ("scale_0", np.float32),
+            ("scale_1", np.float32),
+            ("scale_2", np.float32),
+            ("rot_0", np.float32),
+            ("rot_1", np.float32),
+            ("rot_2", np.float32),
+            ("rot_3", np.float32),
+        ]
+    )
+
+    data = np.empty(num_points, dtype=dtype_fields)
+    data["x"] = xyz[:, 0]
+    data["y"] = xyz[:, 1]
+    data["z"] = xyz[:, 2]
+    data["nx"] = normals[:, 0]
+    data["ny"] = normals[:, 1]
+    data["nz"] = normals[:, 2]
+    data["f_dc_0"] = f_dc[:, 0]
+    data["f_dc_1"] = f_dc[:, 1]
+    data["f_dc_2"] = f_dc[:, 2]
+    for i in range(f_rest.shape[1]):
+        data[f"f_rest_{i}"] = f_rest[:, i]
+    data["opacity"] = opacity_logit[:, 0]
+    data["scale_0"] = log_scales[:, 0]
+    data["scale_1"] = log_scales[:, 1]
+    data["scale_2"] = log_scales[:, 2]
+    data["rot_0"] = rotations[:, 0]
+    data["rot_1"] = rotations[:, 1]
+    data["rot_2"] = rotations[:, 2]
+    data["rot_3"] = rotations[:, 3]
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("wb") as f:
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {num_points}\n"
+        )
+        for name, np_type in dtype_fields:
+            if np_type is not np.float32:
+                raise TypeError(f"Unexpected dtype for Gaussian PLY field {name}: {np_type}")
+            header += f"property float {name}\n"
+        header += "end_header\n"
+        f.write(header.encode("ascii"))
         f.write(data.tobytes())

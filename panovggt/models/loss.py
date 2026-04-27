@@ -20,7 +20,10 @@ import torch.nn.functional as F
 from panovggt.utils.geometry import homogenize_points, se3_inverse, depth_edge
 from panovggt.utils.alignment import align_points_scale
 from panovggt.utils.rotation import mat_to_quat, quat_to_mat
-from panovggt.utils.gaussian_render import GaussianCubemapRenderLoss
+from panovggt.utils.gaussian_render import (
+    GSPLAT_SH_C0,
+    GaussianCubemapRenderLoss,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -586,6 +589,9 @@ class GaussianLoss(nn.Module):
         keep_weight: float = 0.05,
         split_weight: float = 0.05,
         sh_weight: float = 0.08,
+        sh_rest_reg_weight: float = 0.002,
+        sh_rest_warmup_start: float = 0.0,
+        sh_rest_warmup_end: float = 0.35,
         offset_reg_weight: float = 0.01,
         render_config: Optional[Dict[str, object]] = None,
     ):
@@ -604,6 +610,9 @@ class GaussianLoss(nn.Module):
         self.keep_weight = keep_weight
         self.split_weight = split_weight
         self.sh_weight = sh_weight
+        self.sh_rest_reg_weight = sh_rest_reg_weight
+        self.sh_rest_warmup_start = float(sh_rest_warmup_start)
+        self.sh_rest_warmup_end = float(sh_rest_warmup_end)
         self.offset_reg_weight = offset_reg_weight
 
         render_config = render_config or {}
@@ -619,7 +628,24 @@ class GaussianLoss(nn.Module):
                 opacity_floor=render_config.get("opacity_floor", 1e-4),
                 fov_degrees=render_config.get("fov_degrees", 90.0),
                 sh_degree=sh_degree,
+                sh_warmup_start=render_config.get("sh_warmup_start", 0.0),
+                sh_warmup_end=render_config.get("sh_warmup_end", 0.35),
             )
+
+    def _high_order_scale(self, progress: object) -> float:
+        if isinstance(progress, torch.Tensor):
+            progress = float(progress.detach().float().mean().item())
+        elif progress is None:
+            progress = 1.0
+        else:
+            progress = float(progress)
+
+        if self.sh_rest_warmup_end <= self.sh_rest_warmup_start:
+            return 1.0
+        scale = (progress - self.sh_rest_warmup_start) / (
+            self.sh_rest_warmup_end - self.sh_rest_warmup_start
+        )
+        return float(max(0.0, min(1.0, scale)))
 
     def _patchify_scalar(self, x: torch.Tensor) -> torch.Tensor:
         B, N, H, W = x.shape
@@ -781,7 +807,9 @@ class GaussianLoss(nn.Module):
             device=patch_rgb.device,
             dtype=patch_rgb.dtype,
         )
-        sh_target[..., 0, :] = patch_rgb.clamp(0.0, 1.0)
+        sh_target[..., 0, :] = (
+            patch_rgb.clamp(0.0, 1.0) - 0.5
+        ) / GSPLAT_SH_C0
 
         return {
             "patch_valid": patch_valid,
@@ -814,10 +842,13 @@ class GaussianLoss(nn.Module):
         keep_loss = zero
         split_loss = zero
         sh_loss = zero
+        sh_dc_loss = zero
+        sh_rest_reg = zero
         offset_reg = zero
         target_keep_ratio = zero
         target_importance_mean = zero
         pred_keep_prob_mean = zero
+        sh_high_order_scale = self._high_order_scale(gt.get("gaussian_progress", 1.0))
 
         if patch_valid.any().item():
             center_loss = F.smooth_l1_loss(
@@ -863,7 +894,10 @@ class GaussianLoss(nn.Module):
 
             pred_sh = pred["gaussian_token_sh"][patch_valid]
             target_sh = target["sh_target"][patch_valid]
-            sh_loss = F.l1_loss(pred_sh[:, 0], target_sh[:, 0])
+            sh_dc_loss = F.l1_loss(pred_sh[:, 0], target_sh[:, 0])
+            sh_loss = sh_dc_loss
+            if pred_sh.shape[1] > 1:
+                sh_rest_reg = pred_sh[:, 1:].pow(2).mean()
 
             if (
                 "gaussian_child_offsets" in pred
@@ -889,6 +923,7 @@ class GaussianLoss(nn.Module):
             + self.keep_weight * keep_loss
             + self.split_weight * split_loss
             + self.sh_weight * sh_loss
+            + self.sh_rest_reg_weight * (1.0 - sh_high_order_scale) * sh_rest_reg
             + self.offset_reg_weight * offset_reg
             + self.render_weight * render_loss
         )
@@ -901,6 +936,9 @@ class GaussianLoss(nn.Module):
             "gaussian_keep_loss": keep_loss,
             "gaussian_split_loss": split_loss,
             "gaussian_sh_loss": sh_loss,
+            "gaussian_sh_dc_loss": sh_dc_loss,
+            "gaussian_sh_rest_reg": sh_rest_reg,
+            "gaussian_sh_high_order_scale": zero.new_tensor(sh_high_order_scale),
             "gaussian_offset_reg": offset_reg,
             "gaussian_target_keep_ratio": target_keep_ratio,
             "gaussian_target_importance": target_importance_mean,
@@ -932,6 +970,7 @@ class Loss(nn.Module):
         enable_3dgs: bool = False,
         gaussian_head: Optional[Dict[str, Union[int, float, bool]]] = None,
         gaussian_render: Optional[Dict[str, object]] = None,
+        gaussian_supervision: Optional[Dict[str, object]] = None,
         point_loss_weight: float = 1.0,
         camera_loss_weight: float = 0.1,
         gaussian_loss_weight: float = 0.2,
@@ -956,6 +995,7 @@ class Loss(nn.Module):
                 enable_stage1=gaussian_head.get("enable_stage1", True),
                 keep_target_threshold=gaussian_head.get("keep_threshold", 0.35),
                 render_config=gaussian_render,
+                **(gaussian_supervision or {}),
             )
             if enable_3dgs
             else None
@@ -1045,6 +1085,7 @@ class Loss(nn.Module):
             'camera_poses': poses_c2w,
             'depths': gt.get('depths', None),
             'norm_factors': gt.get('norm_factors', None),
+            'gaussian_progress': gt.get('gaussian_progress', None),
         }
     
     def normalize_pred(
@@ -1207,6 +1248,9 @@ class Loss(nn.Module):
             'loss_gaussian_keep': as_tensor(gaussian_details.get('gaussian_keep_loss', zero)),
             'loss_gaussian_split': as_tensor(gaussian_details.get('gaussian_split_loss', zero)),
             'loss_gaussian_sh': as_tensor(gaussian_details.get('gaussian_sh_loss', zero)),
+            'loss_gaussian_sh_dc': as_tensor(gaussian_details.get('gaussian_sh_dc_loss', zero)),
+            'loss_gaussian_sh_rest_reg': as_tensor(gaussian_details.get('gaussian_sh_rest_reg', zero)),
+            'loss_gaussian_sh_high_order_scale': as_tensor(gaussian_details.get('gaussian_sh_high_order_scale', zero)),
             'loss_gaussian_offset_reg': as_tensor(gaussian_details.get('gaussian_offset_reg', zero)),
             'loss_gaussian_render': as_tensor(gaussian_details.get('gaussian_render_loss', zero)),
             'loss_gaussian_render_rgb': as_tensor(gaussian_details.get('gaussian_render_rgb_loss', zero)),
