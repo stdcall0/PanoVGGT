@@ -28,11 +28,9 @@ git checkout gaussian
 - `hydra 1.3.2`
 - `omegaconf 2.3.0`
 
-另外训练入口还依赖这些包，环境里也已经补齐：
+另外训练入口还依赖这个包，环境里也已经补齐：
 
 - `iopath`
-- `fvcore`
-- `wcmatch`
 
 说明：
 
@@ -111,7 +109,7 @@ PanoCity 的 `split` 语义还有一个要注意的点：
 这次不是 resume 旧训练，而是拿原版权重做初始化：
 
 - 配置项：`checkpoint.init_checkpoint_path: /home/featurize/PanoVGGT/checkpoints/model.pt`
-- 实际配置文件：`training/config/panocity_partial_gaussian_v2_base.yaml`
+- 实际配置文件：`training/config/panocity_gaussian.yaml`
 
 对应策略：
 
@@ -157,7 +155,7 @@ Train Epoch: [0][  0/449]
 实际启动配置：
 
 - `training/config/gaussian_only.yaml`
-- `training/config/panocity_partial_gaussian_v2_base.yaml`
+- `training/config/panocity_gaussian.yaml`
 
 关键配置：
 
@@ -227,7 +225,7 @@ data:
 cd /home/featurize/PanoVGGT
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export PANOVGGT_SKIP_DINOV2_DOWNLOAD=1
-conda run -n panovggt torchrun --standalone --nproc_per_node=1 training/launch.py --config panocity_partial_gaussian_v2_base
+conda run -n panovggt torchrun --standalone --nproc_per_node=1 training/launch.py --config panocity_gaussian
 ```
 
 说明：
@@ -238,17 +236,17 @@ conda run -n panovggt torchrun --standalone --nproc_per_node=1 training/launch.p
 后台 `screen` 启动方式：
 
 ```bash
-screen -dmS panocity_gaussian_v2_base -L -Logfile /home/featurize/PanoVGGT/outputs/panocity_partial_gaussian_v2_base_screen.log zsh -lc 'cd /home/featurize/PanoVGGT && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export PANOVGGT_SKIP_DINOV2_DOWNLOAD=1 && exec conda run -n panovggt torchrun --standalone --nproc_per_node=1 training/launch.py --config panocity_partial_gaussian_v2_base'
+screen -dmS panocity_gaussian -L -Logfile /home/featurize/PanoVGGT/outputs/panocity_gaussian_screen.log zsh -lc 'cd /home/featurize/PanoVGGT && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export PANOVGGT_SKIP_DINOV2_DOWNLOAD=1 && exec conda run -n panovggt torchrun --standalone --nproc_per_node=1 training/launch.py --config panocity_gaussian'
 ```
 
 当前训练会话名：
 
-- `panocity_gaussian_v2_base`
+- `panocity_gaussian`
 
 进入会话：
 
 ```bash
-screen -r panocity_gaussian_v2_base
+screen -r panocity_gaussian
 ```
 
 离开但不杀进程：
@@ -262,13 +260,13 @@ Ctrl+A 然后按 D
 主训练日志：
 
 ```bash
-tail -f /home/featurize/PanoVGGT/outputs/panocity_partial_gaussian_v2_base/log.txt
+tail -f /home/featurize/PanoVGGT/outputs/panocity_gaussian/log.txt
 ```
 
 `screen` 原始输出：
 
 ```bash
-tail -f /home/featurize/PanoVGGT/outputs/panocity_partial_gaussian_v2_base_screen.log
+tail -f /home/featurize/PanoVGGT/outputs/panocity_gaussian_screen.log
 ```
 
 看 GPU：
@@ -280,7 +278,7 @@ nvidia-smi
 看进程：
 
 ```bash
-ps -ef | rg 'training/launch.py --config panocity_partial_gaussian_v2_base|torchrun --standalone --nproc_per_node=1|panocity_partial_gaussian_v2_base'
+ps -ef | rg 'training/launch.py --config panocity_gaussian|torchrun --standalone --nproc_per_node=1|panocity_gaussian'
 ```
 
 看 screen 会话：
@@ -297,9 +295,9 @@ conda run -n panovggt tensorboard --logdir /home/featurize/PanoVGGT/outputs/tens
 
 输出目录：
 
-- 日志：`/home/featurize/PanoVGGT/outputs/panocity_partial_gaussian_v2_base/log.txt`
-- TensorBoard：`/home/featurize/PanoVGGT/outputs/tensorboard/panocity_partial_gaussian_v2_base`
-- checkpoint：`/home/featurize/PanoVGGT/outputs/panocity_partial_gaussian_v2_base/ckpts`
+- 日志：`/home/featurize/PanoVGGT/outputs/panocity_gaussian/log.txt`
+- TensorBoard：`/home/featurize/PanoVGGT/outputs/tensorboard/panocity_gaussian`
+- checkpoint：`/home/featurize/PanoVGGT/outputs/panocity_gaussian/ckpts`
 
 ## 8. 这次为训练做的代码修改和注意事项
 
@@ -325,7 +323,7 @@ conda run -n panovggt tensorboard --logdir /home/featurize/PanoVGGT/outputs/tens
 文件：
 
 - `training/config/gaussian_only.yaml`
-- `training/config/panocity_partial_gaussian_v2_base.yaml`
+- `training/config/panocity_gaussian.yaml`
 
 作用：
 

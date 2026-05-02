@@ -44,9 +44,29 @@ _INPUT_W = 1036
 #  1.  Model Loading
 # =========================================================================
 
-def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTModel:
-    cfg = OmegaConf.load(config_path)
+def load_config(config_path: str):
+    """Load either a plain OmegaConf file or a Hydra config with defaults."""
+    path = Path(config_path).resolve()
+    cfg = OmegaConf.load(path)
+    if "defaults" not in cfg:
+        OmegaConf.resolve(cfg)
+        return cfg
+
+    try:
+        from hydra import compose, initialize_config_dir
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Config {config_path} uses Hydra defaults, but hydra-core is not installed."
+        ) from exc
+
+    with initialize_config_dir(config_dir=str(path.parent), version_base=None):
+        cfg = compose(config_name=path.stem)
     OmegaConf.resolve(cfg)
+    return cfg
+
+
+def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTModel:
+    cfg = load_config(config_path)
     mc = cfg.model
     gaussian_head_cfg = getattr(mc, "gaussian_head", None)
     model = PanoVGGTModel(

@@ -6,6 +6,7 @@
 
 import logging
 import itertools
+import fnmatch
 from typing import Any, Dict, List, Mapping, Iterable, Set, Tuple, Union
 
 import hydra
@@ -62,13 +63,13 @@ class OptimizerWrapper:
 
 
 def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
-    """Ensure param groups are non-overlapping and include all model params."""
+    """Ensure param groups are non-overlapping and include trainable params."""
 
     for pg in param_groups:
         assert len(pg["params"]) == len(set(pg["params"]))
 
     parameters = [set(pg["params"]) for pg in param_groups]
-    model_parameters = {p for _, p in model.named_parameters()}
+    model_parameters = {p for _, p in model.named_parameters() if p.requires_grad}
 
     for p1, p2 in itertools.permutations(parameters, 2):
         assert p1.isdisjoint(p2), "Parameter groups should be disjoint"
@@ -83,14 +84,20 @@ def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
 # Glob helpers for pattern matching
 # -----------------------------------------------------------------------------
 
-from wcmatch import fnmatch
+def _matches_name(name: str, pattern: str) -> bool:
+    """Match both raw module names and DDP's ``module.``-prefixed names."""
+    for part in str(pattern).split("|"):
+        if not part:
+            continue
+        if fnmatch.fnmatchcase(name, part):
+            return True
+        if name.startswith("module.") and fnmatch.fnmatchcase(name[7:], part):
+            return True
+    return False
 
-GLOB_FLAGS = (
-    fnmatch.CASE       # case-sensitive
-    | fnmatch.DOTMATCH # '*' also matches '.'
-    | fnmatch.EXTMATCH # extended patterns like *(foo|bar)
-    | fnmatch.SPLIT    # "pat1|pat2" works out-of-the-box
-)
+
+def _filter_names(names: Set[str], pattern: str) -> List[str]:
+    return [name for name in names if _matches_name(name, pattern)]
 
 
 def get_full_parameter_name(module_name: str, param_name: str) -> str:
@@ -114,7 +121,7 @@ def unix_param_pattern_to_parameter_names(filter_param_names: Union[List[str], N
         return set()
     allowed = []
     for pat in filter_param_names:
-        matches = set(fnmatch.filter(parameter_names, pat, flags=GLOB_FLAGS))
+        matches = set(_filter_names(parameter_names, pat))
         if not matches:
             raise AssertionError(f"Pattern {pat} matched no parameters")
         logging.info(f"Matches for param pattern [{pat}]: {matches}")
@@ -215,7 +222,9 @@ def construct_optimizer(model: nn.Module,
     *No* allowlist handling – we always optimize *all* model parameters.
     """
 
-    named_parameters = dict(model.named_parameters())
+    named_parameters = {
+        name: param for name, param in model.named_parameters() if param.requires_grad
+    }
     all_parameter_names = set(named_parameters.keys())
     module_cls_to_all_param_names = get_module_cls_to_param_names(model)
 

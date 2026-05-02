@@ -42,7 +42,8 @@ def _balanced_soft_bce(
     pred: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
-    pred = pred.float().clamp(1e-5, 1.0 - 1e-5)
+    eps = 1e-5
+    pred = pred.float().clamp(0.0, 1.0)
     target = target.float().clamp(0.0, 1.0)
 
     with torch.no_grad():
@@ -59,8 +60,16 @@ def _balanced_soft_bce(
         weight = balance * confidence
         weight = weight / weight.mean().clamp_min(1e-6)
 
-    pred_logits = torch.logit(pred)
-    return F.binary_cross_entropy_with_logits(pred_logits, target, weight=weight)
+    # Keep the loss finite without cutting gradients at exactly transparent or
+    # opaque pixels.  clamp+logit would produce zero gradient for pred <= eps,
+    # which is especially harmful when early Gaussians render near-zero alpha.
+    pred_prob = pred * (1.0 - 2.0 * eps) + eps
+    with torch.amp.autocast(pred_prob.device.type, enabled=False):
+        return F.binary_cross_entropy(
+            pred_prob.float(),
+            target.float(),
+            weight=weight.float(),
+        )
 
 
 class GaussianCubemapRenderLoss(nn.Module):
@@ -78,6 +87,8 @@ class GaussianCubemapRenderLoss(nn.Module):
         sh_degree: int = 3,
         sh_warmup_start: float = 0.0,
         sh_warmup_end: float = 0.35,
+        weight_warmup_start: float = 0.05,
+        weight_warmup_end: float = 0.25,
     ):
         super().__init__()
         self.cube_dim = int(cube_dim)
@@ -90,7 +101,13 @@ class GaussianCubemapRenderLoss(nn.Module):
         self.sh_degree = int(sh_degree)
         self.sh_warmup_start = float(sh_warmup_start)
         self.sh_warmup_end = float(sh_warmup_end)
+        self.weight_warmup_start = float(weight_warmup_start)
+        self.weight_warmup_end = float(weight_warmup_end)
 
+        # These are the row-vector rotations used by Equirec2Cube: a point in a
+        # cube-face camera is mapped into the panorama camera as p_face @ R.
+        # Camera c2w matrices use column vectors, so _build_face_cameras uses
+        # R.T for the corresponding face-to-panorama rotation.
         face_rotations = torch.tensor(
             [
                 [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]],  # back
@@ -107,6 +124,10 @@ class GaussianCubemapRenderLoss(nn.Module):
         self._warned_missing_gsplat = False
 
     def _high_order_scale(self, progress: object) -> float:
+        return self._linear_warmup(progress, self.sh_warmup_start, self.sh_warmup_end)
+
+    @staticmethod
+    def _linear_warmup(progress: object, start: float, end: float) -> float:
         if isinstance(progress, torch.Tensor):
             progress = float(progress.detach().float().mean().item())
         elif progress is None:
@@ -114,12 +135,15 @@ class GaussianCubemapRenderLoss(nn.Module):
         else:
             progress = float(progress)
 
-        if self.sh_warmup_end <= self.sh_warmup_start:
+        if end <= start:
             return 1.0
-        scale = (progress - self.sh_warmup_start) / (
-            self.sh_warmup_end - self.sh_warmup_start
-        )
+        scale = (progress - start) / (end - start)
         return float(max(0.0, min(1.0, scale)))
+
+    def _render_weight_scale(self, progress: object) -> float:
+        return self._linear_warmup(
+            progress, self.weight_warmup_start, self.weight_warmup_end
+        )
 
     def _get_rasterization(self):
         bootstrap_gsplat_runtime(preload_runtime_libs=False)
@@ -182,7 +206,7 @@ class GaussianCubemapRenderLoss(nn.Module):
         cube_images = projector(flat_images, mode="bilinear").view(
             batch_size, num_frames, 6, 3, self.cube_dim, self.cube_dim
         )
-        cube_points = projector(flat_points, mode="bilinear").view(
+        cube_points = projector(flat_points * flat_masks, mode="bilinear").view(
             batch_size, num_frames, 6, 3, self.cube_dim, self.cube_dim
         )
         cube_masks = projector(flat_masks, mode="bilinear").view(
@@ -195,6 +219,7 @@ class GaussianCubemapRenderLoss(nn.Module):
         cube_images = cube_images.index_select(2, face_ids)
         cube_points = cube_points.index_select(2, face_ids)
         cube_masks = cube_masks.index_select(2, face_ids)
+        cube_points = cube_points / cube_masks.clamp_min(1e-6)
 
         rot = self._face_rotations.to(device=images.device).index_select(0, face_ids).to(
             dtype=cube_points.dtype
@@ -207,6 +232,12 @@ class GaussianCubemapRenderLoss(nn.Module):
         target_rgb = cube_images.permute(0, 1, 2, 4, 5, 3).contiguous()
         target_alpha = cube_masks.permute(0, 1, 2, 4, 5, 3).contiguous().clamp(0.0, 1.0)
         raw_depth = cube_points[..., 2:3]
+        norm_factors = gt.get("norm_factors")
+        if isinstance(norm_factors, torch.Tensor):
+            depth_scale = norm_factors.to(
+                device=raw_depth.device, dtype=raw_depth.dtype
+            ).clamp_min(1e-6)
+            raw_depth = raw_depth / depth_scale.view(-1, 1, 1, 1, 1, 1)
         depth_valid = torch.isfinite(raw_depth) & (raw_depth > 1e-4)
         target_depth = torch.nan_to_num(raw_depth, nan=0.0, posinf=0.0, neginf=0.0)
         target_support = target_alpha * depth_valid.to(target_alpha.dtype)
@@ -238,11 +269,15 @@ class GaussianCubemapRenderLoss(nn.Module):
             return None
 
         slot_count = keep.numel()
-        means = means[keep]
-        scales = scales[keep].clamp_min(1e-5)
-        rotations = F.normalize(rotations[keep], dim=-1, eps=1e-6)
-        opacities = opacity_scalar[keep].clamp(1e-5, 1.0 - 1e-5)
-        sh_coeffs = sh[keep]
+        # gsplat kernels are most stable with fp32 Gaussian parameters.  The
+        # Gaussian head currently emits fp32 under autocast-disabled blocks, but
+        # keep the renderer boundary explicit so future AMP changes do not feed
+        # bf16/fp16 tensors into the CUDA rasterizer.
+        means = means[keep].float()
+        scales = scales[keep].float().clamp_min(1e-5)
+        rotations = F.normalize(rotations[keep].float(), dim=-1, eps=1e-6)
+        opacities = opacity_scalar[keep].float().clamp(1e-5, 1.0 - 1e-5)
+        sh_coeffs = sh[keep].float()
         if sh_coeffs.shape[-2] > 1 and high_order_scale < 1.0:
             sh_coeffs = sh_coeffs.clone()
             sh_coeffs[..., 1:, :] *= high_order_scale
@@ -265,17 +300,18 @@ class GaussianCubemapRenderLoss(nn.Module):
             face_rot = self._face_rotations.to(device=device, dtype=torch.float32).index_select(
                 0, face_ids
             )
+            face_to_pano = face_rot.transpose(-1, -2)
             face_rot4 = torch.eye(4, device=device, dtype=torch.float32).view(1, 1, 4, 4).repeat(
                 c2w_frames.shape[0], face_rot.shape[0], 1, 1
             )
-            face_rot4[..., :3, :3] = face_rot.view(1, face_rot.shape[0], 3, 3)
+            face_rot4[..., :3, :3] = face_to_pano.view(1, face_rot.shape[0], 3, 3)
             face_c2w = c2w_frames.float().unsqueeze(1) @ face_rot4
             viewmats = torch.linalg.inv(face_c2w)
             K = self._cube_intrinsics(device, torch.float32)
             Ks = K.view(1, 1, 3, 3).expand(
                 c2w_frames.shape[0], face_rot.shape[0], 3, 3
             )
-        return viewmats.reshape(-1, 4, 4), Ks.reshape(-1, 3, 3)
+        return viewmats.reshape(-1, 4, 4).contiguous(), Ks.reshape(-1, 3, 3).contiguous()
 
     def forward(
         self,
@@ -304,6 +340,8 @@ class GaussianCubemapRenderLoss(nn.Module):
                 "gaussian_mean_scale": zero,
                 "gaussian_target_alpha_mean": zero,
                 "gaussian_render_alpha_mean": zero,
+                "gaussian_target_visible_mean": zero,
+                "gaussian_render_visible_mean": zero,
                 "gaussian_sh_high_order_scale": zero,
             }
 
@@ -322,12 +360,16 @@ class GaussianCubemapRenderLoss(nn.Module):
                 "gaussian_mean_scale": zero,
                 "gaussian_target_alpha_mean": zero,
                 "gaussian_render_alpha_mean": zero,
+                "gaussian_target_visible_mean": zero,
+                "gaussian_render_visible_mean": zero,
                 "gaussian_sh_high_order_scale": zero,
             }
         target_rgb, target_depth, target_alpha, target_support = self._prepare_targets(
             gt, frame_indices
         )
-        high_order_scale = self._high_order_scale(gt.get("gaussian_progress", 1.0))
+        progress = gt.get("gaussian_progress", 1.0)
+        high_order_scale = self._high_order_scale(progress)
+        render_weight_scale = self._render_weight_scale(progress)
 
         rgb_terms = []
         depth_terms = []
@@ -338,6 +380,8 @@ class GaussianCubemapRenderLoss(nn.Module):
         scale_means = []
         target_alpha_means = []
         render_alpha_means = []
+        render_visible_means = []
+        target_visible_means = []
 
         for batch_idx in range(gt["imgs"].shape[0]):
             gaussian_pack = self._flatten_batch_gaussians(
@@ -383,7 +427,7 @@ class GaussianCubemapRenderLoss(nn.Module):
             rgb_mask = target_support_b.expand_as(render_rgb)
             rgb_terms.append(_masked_l1(render_rgb, target_rgb_b, rgb_mask))
             depth_terms.append(_masked_l1(render_depth, target_depth_b, target_support_b))
-            alpha_terms.append(_balanced_soft_bce(render_alphas, target_alpha_b))
+            alpha_terms.append(_balanced_soft_bce(render_alphas, target_support_b))
             active_counts.append(render_alphas.new_tensor(float(gaussian_pack["means"].shape[0])))
             active_ratios.append(
                 render_alphas.new_tensor(
@@ -392,8 +436,10 @@ class GaussianCubemapRenderLoss(nn.Module):
             )
             opacity_means.append(gaussian_pack["opacities"].mean())
             scale_means.append(gaussian_pack["scales"].mean())
-            target_alpha_means.append(target_alpha_b.mean())
+            target_alpha_means.append(target_support_b.mean())
             render_alpha_means.append(render_alphas.mean())
+            render_visible_means.append((render_alphas > 0.5).to(render_alphas.dtype).mean())
+            target_visible_means.append((target_support_b > 0.5).to(target_support_b.dtype).mean())
 
         if not rgb_terms:
             return zero, {
@@ -407,7 +453,10 @@ class GaussianCubemapRenderLoss(nn.Module):
                 "gaussian_mean_scale": zero,
                 "gaussian_target_alpha_mean": zero,
                 "gaussian_render_alpha_mean": zero,
+                "gaussian_target_visible_mean": zero,
+                "gaussian_render_visible_mean": zero,
                 "gaussian_sh_high_order_scale": zero.new_tensor(high_order_scale),
+                "gaussian_render_weight_scale": zero.new_tensor(render_weight_scale),
             }
 
         rgb_loss = torch.stack(rgb_terms).mean()
@@ -419,7 +468,13 @@ class GaussianCubemapRenderLoss(nn.Module):
         mean_scale = torch.stack(scale_means).mean() if scale_means else zero
         target_alpha_mean = torch.stack(target_alpha_means).mean() if target_alpha_means else zero
         render_alpha_mean = torch.stack(render_alpha_means).mean() if render_alpha_means else zero
-        total_loss = (
+        render_visible_mean = (
+            torch.stack(render_visible_means).mean() if render_visible_means else zero
+        )
+        target_visible_mean = (
+            torch.stack(target_visible_means).mean() if target_visible_means else zero
+        )
+        total_loss = render_weight_scale * (
             self.rgb_weight * rgb_loss
             + self.depth_weight * depth_loss
             + self.alpha_weight * alpha_loss
@@ -435,5 +490,8 @@ class GaussianCubemapRenderLoss(nn.Module):
             "gaussian_mean_scale": mean_scale,
             "gaussian_target_alpha_mean": target_alpha_mean,
             "gaussian_render_alpha_mean": render_alpha_mean,
+            "gaussian_target_visible_mean": target_visible_mean,
+            "gaussian_render_visible_mean": render_visible_mean,
             "gaussian_sh_high_order_scale": zero.new_tensor(high_order_scale),
+            "gaussian_render_weight_scale": zero.new_tensor(render_weight_scale),
         }

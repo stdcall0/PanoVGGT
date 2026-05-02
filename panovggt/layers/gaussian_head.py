@@ -66,6 +66,10 @@ class GaussianStage1Head(nn.Module):
         self._init_linear(self.keep_head.net[-1], std=1e-3, bias=1.5)
         self._init_linear(self.split_head.net[-1], std=1e-3, bias=0.0)
         with torch.no_grad():
+            # Start from one Gaussian per valid patch.  Densification should be
+            # earned by the split loss; initializing to the max split makes the
+            # render path see every child slot from the first step and tends to
+            # produce over-dense grey blobs.
             self.split_head.net[-1].bias[0] = 3.0
 
     def forward(
@@ -137,6 +141,12 @@ class GaussianParameterHead(nn.Module):
         sh_degree: int = 3,
         log_scale_min: float = -6.0,
         log_scale_max: float = 1.5,
+        token_opacity_init: float = 0.78,
+        child_opacity_init: float = 0.72,
+        max_child_offset: float = 0.25,
+        mean_anchor_scale: float = 1.0,
+        max_mean_residual: float = 0.25,
+        child_anchor_scale: float = 1.0,
     ):
         super().__init__()
         if max_gaussians_per_token < 1:
@@ -149,6 +159,12 @@ class GaussianParameterHead(nn.Module):
         self.num_sh_bases = (sh_degree + 1) ** 2
         self.log_scale_min = float(log_scale_min)
         self.log_scale_max = float(log_scale_max)
+        self.token_opacity_init = float(token_opacity_init)
+        self.child_opacity_init = float(child_opacity_init)
+        self.max_child_offset = float(max_child_offset)
+        self.mean_anchor_scale = float(mean_anchor_scale)
+        self.max_mean_residual = float(max_mean_residual)
+        self.child_anchor_scale = float(child_anchor_scale)
 
         self.trunk = nn.Sequential(
             nn.LayerNorm(in_dim),
@@ -157,11 +173,15 @@ class GaussianParameterHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
         )
+        self.mean_anchor_head = nn.Linear(in_dim, 3)
         self.mean_head = nn.Linear(hidden_dim, 3)
         self.log_scale_head = nn.Linear(hidden_dim, 3)
         self.rotation_head = nn.Linear(hidden_dim, 4)
         self.opacity_head = nn.Linear(hidden_dim, 1)
         self.sh_head = nn.Linear(hidden_dim, self.num_sh_bases * 3)
+        self.child_anchor_offset_head = nn.Linear(
+            in_dim, self.num_split_offsets * 3
+        )
         self.offset_head = nn.Linear(hidden_dim, self.num_split_offsets * 3)
         self.child_log_scale_head = nn.Linear(hidden_dim, self.num_split_offsets * 3)
         self.child_rotation_head = nn.Linear(hidden_dim, self.num_split_offsets * 4)
@@ -182,16 +202,23 @@ class GaussianParameterHead(nn.Module):
         nn.init.constant_(linear.bias, bias)
 
     def _init_parameters(self) -> None:
+        self._init_linear(self.mean_anchor_head, std=0.0, bias=0.0)
         self._init_linear(self.mean_head, std=1e-3, bias=0.0)
-        self._init_linear(self.log_scale_head, std=1e-3, bias=-2.3)
+        # Patch targets in the normalized scene are typically around 0.1-0.3m.
+        # Starting from extremely small Gaussians under-covers cube faces and
+        # leaves the render-alpha loss with weak gradients.
+        self._init_linear(self.log_scale_head, std=1e-3, bias=-1.5)
         self._init_linear(self.rotation_head, std=1e-3, bias=0.0)
-        self._init_linear(self.opacity_head, std=1e-3, bias=self._logit(0.05))
+        self._init_linear(
+            self.opacity_head, std=1e-3, bias=self._logit(self.token_opacity_init)
+        )
         self._init_linear(self.sh_head, std=1e-3, bias=0.0)
+        self._init_linear(self.child_anchor_offset_head, std=0.0, bias=0.0)
         self._init_linear(self.offset_head, std=1e-3, bias=0.0)
-        self._init_linear(self.child_log_scale_head, std=1e-3, bias=-2.8)
+        self._init_linear(self.child_log_scale_head, std=1e-3, bias=-1.6)
         self._init_linear(self.child_rotation_head, std=1e-3, bias=0.0)
         self._init_linear(
-            self.child_opacity_head, std=1e-3, bias=self._logit(0.02)
+            self.child_opacity_head, std=1e-3, bias=self._logit(self.child_opacity_init)
         )
         self._init_linear(self.child_sh_head, std=1e-3, bias=0.0)
         with torch.no_grad():
@@ -209,7 +236,9 @@ class GaussianParameterHead(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         hidden = self.trunk(tokens)
 
-        means = self.mean_head(hidden)
+        mean_anchor = self.mean_anchor_scale * self.mean_anchor_head(tokens)
+        mean_residual = torch.tanh(self.mean_head(hidden)) * self.max_mean_residual
+        means = mean_anchor + mean_residual
         log_scales = self.log_scale_head(hidden).clamp(
             min=self.log_scale_min, max=self.log_scale_max
         )
@@ -222,8 +251,16 @@ class GaussianParameterHead(nn.Module):
         )
 
         if self.num_split_offsets > 0:
-            child_offsets = self.offset_head(hidden).view(
+            child_anchor_offsets = self.child_anchor_offset_head(tokens).view(
                 *hidden.shape[:-1], self.num_split_offsets, 3
+            )
+            raw_child_offsets = self.offset_head(hidden).view(
+                *hidden.shape[:-1], self.num_split_offsets, 3
+            )
+            child_residual_offsets = torch.tanh(raw_child_offsets) * self.max_child_offset
+            child_offsets = (
+                self.child_anchor_scale * child_anchor_offsets
+                + child_residual_offsets
             )
             child_log_scales = self.child_log_scale_head(hidden).view(
                 *hidden.shape[:-1], self.num_split_offsets, 3
@@ -242,6 +279,8 @@ class GaussianParameterHead(nn.Module):
                 *hidden.shape[:-1], self.num_split_offsets, self.num_sh_bases, 3
             )
         else:
+            child_anchor_offsets = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
+            child_residual_offsets = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
             child_offsets = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
             child_log_scales = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
             child_scales = hidden.new_zeros(*hidden.shape[:-1], 0, 3)
@@ -252,12 +291,20 @@ class GaussianParameterHead(nn.Module):
 
         grid_shape = (batch_size, num_frames, patch_h, patch_w)
         means = means.view(*grid_shape, 3)
+        mean_anchor = mean_anchor.view(*grid_shape, 3)
+        mean_residual = mean_residual.view(*grid_shape, 3)
         log_scales = log_scales.view(*grid_shape, 3)
         scales = scales.view(*grid_shape, 3)
         rotations = rotations.view(*grid_shape, 4)
         opacity_logits = opacity_logits.view(*grid_shape, 1)
         opacity = opacity.view(*grid_shape, 1)
         sh_coeffs = sh_coeffs.view(*grid_shape, self.num_sh_bases, 3)
+        child_anchor_offsets = child_anchor_offsets.view(
+            *grid_shape, self.num_split_offsets, 3
+        )
+        child_residual_offsets = child_residual_offsets.view(
+            *grid_shape, self.num_split_offsets, 3
+        )
         child_offsets = child_offsets.view(
             *grid_shape, self.num_split_offsets, 3
         )
@@ -278,12 +325,16 @@ class GaussianParameterHead(nn.Module):
 
         return {
             "gaussian_token_means": means,
+            "gaussian_token_mean_anchor": mean_anchor,
+            "gaussian_token_mean_residual": mean_residual,
             "gaussian_token_log_scales": log_scales,
             "gaussian_token_scales": scales,
             "gaussian_token_rotations": rotations,
             "gaussian_token_opacity_logits": opacity_logits,
             "gaussian_token_opacity": opacity,
             "gaussian_token_sh": sh_coeffs,
+            "gaussian_child_anchor_offsets": child_anchor_offsets,
+            "gaussian_child_residual_offsets": child_residual_offsets,
             "gaussian_child_offsets": child_offsets,
             "gaussian_child_log_scales": child_log_scales,
             "gaussian_child_scales": child_scales,
@@ -367,8 +418,10 @@ def assemble_gaussian_outputs(
         active_mask = active_mask & keep_mask
         split_slot_weight = split_slot_weight * keep_mask.to(split_slot_weight.dtype)
 
-    materialized_opacity = materialized_opacity * keep_prob.unsqueeze(-2)
-    materialized_opacity = materialized_opacity * split_slot_weight.unsqueeze(-1)
+    # keep_prob/split_prob are selection signals, not physical opacity.  The
+    # renderer should see the predicted alpha of selected slots directly;
+    # multiplying these probabilities into opacity made early Gaussians nearly
+    # transparent and prevented render alpha from recovering.
     materialized_opacity = materialized_opacity * active_mask.unsqueeze(-1).to(
         materialized_opacity.dtype
     )

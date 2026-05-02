@@ -247,6 +247,7 @@ class Trainer:
 
         model_state_dict = checkpoint.get("model", checkpoint)
         target_model = self.model.module if isinstance(self.model, nn.parallel.DistributedDataParallel) else self.model
+        model_state_dict = self._adapt_initial_state_dict(model_state_dict, target_model)
         missing, unexpected = target_model.load_state_dict(
             model_state_dict, strict=self.checkpoint_conf.strict
         )
@@ -254,6 +255,128 @@ class Trainer:
             logging.info(
                 f"Initialized model. Missing: {missing or 'None'}, Unexpected: {unexpected or 'None'}."
             )
+
+    def _adapt_initial_state_dict(self, state_dict: Mapping[str, Any], target_model: nn.Module) -> Dict[str, Any]:
+        """Reuse compatible pretrained branches for newly added 3DGS modules."""
+        adapted = dict(state_dict)
+        target_state = target_model.state_dict()
+        copied = []
+
+        def copy_if_shape_matches(src_key: str, dst_key: str) -> None:
+            if dst_key in adapted or src_key not in state_dict or dst_key not in target_state:
+                return
+            src_value = state_dict[src_key]
+            if hasattr(src_value, "shape") and src_value.shape == target_state[dst_key].shape:
+                adapted[dst_key] = src_value
+                copied.append((src_key, dst_key))
+
+        for key in list(target_state.keys()):
+            if key.startswith("gaussian_decoder."):
+                suffix = key[len("gaussian_decoder."):]
+                copy_if_shape_matches(f"global_points_decoder.{suffix}", key)
+
+        point_w_key = "global_point_head.proj.weight"
+        point_b_key = "global_point_head.proj.bias"
+
+        point_weight = state_dict.get(point_w_key)
+        point_bias = state_dict.get(point_b_key)
+        patch_size = int(getattr(target_model, "patch_size", 14))
+        expected_rows = 3 * patch_size * patch_size
+        slot_count = int(
+            getattr(target_model, "gaussian_head_config", {}).get(
+                "max_gaussians_per_token", 4
+            )
+        )
+
+        def slot_ids_for_patch(device: torch.device) -> torch.Tensor:
+            if slot_count <= 1:
+                return torch.zeros(patch_size * patch_size, device=device, dtype=torch.long)
+            cols = int(math.ceil(math.sqrt(slot_count)))
+            rows = int(math.ceil(slot_count / cols))
+            y = torch.arange(patch_size, device=device)
+            x = torch.arange(patch_size, device=device)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            row_id = torch.clamp((yy * rows) // patch_size, max=rows - 1)
+            col_id = torch.clamp((xx * cols) // patch_size, max=cols - 1)
+            return torch.clamp(row_id * cols + col_id, max=slot_count - 1).reshape(-1).long()
+
+        def per_slot_average_patch_tensor(value: torch.Tensor) -> Optional[torch.Tensor]:
+            if (
+                value is None
+                or not hasattr(value, "shape")
+                or value.shape[0] != expected_rows
+            ):
+                return None
+            reshaped = value.view(3, patch_size * patch_size, *value.shape[1:])
+            slot_ids = slot_ids_for_patch(reshaped.device)
+            slots = []
+            for slot_idx in range(slot_count):
+                mask = slot_ids == slot_idx
+                if not mask.any().item():
+                    slots.append(reshaped.mean(dim=1))
+                else:
+                    slots.append(reshaped[:, mask].mean(dim=1))
+            return torch.stack(slots, dim=0)
+
+        slot_weight = per_slot_average_patch_tensor(point_weight)
+        slot_bias = per_slot_average_patch_tensor(point_bias)
+
+        anchor_w_key = "gaussian_param_head.mean_anchor_head.weight"
+        anchor_b_key = "gaussian_param_head.mean_anchor_head.bias"
+        if (
+            anchor_w_key not in adapted
+            and anchor_w_key in target_state
+            and slot_weight is not None
+            and slot_weight.shape[0] >= 1
+            and slot_weight.shape[1:] == target_state[anchor_w_key].shape
+        ):
+            adapted[anchor_w_key] = slot_weight[0]
+            copied.append((point_w_key, anchor_w_key))
+
+        if (
+            anchor_b_key not in adapted
+            and anchor_b_key in target_state
+            and slot_bias is not None
+            and slot_bias.shape[0] >= 1
+            and slot_bias.shape[1:] == target_state[anchor_b_key].shape
+        ):
+            adapted[anchor_b_key] = slot_bias[0]
+            copied.append((point_b_key, anchor_b_key))
+
+        child_w_key = "gaussian_param_head.child_anchor_offset_head.weight"
+        child_b_key = "gaussian_param_head.child_anchor_offset_head.bias"
+        if (
+            child_w_key not in adapted
+            and child_w_key in target_state
+            and slot_weight is not None
+            and slot_weight.shape[0] > 1
+            and slot_weight.shape[1:] == target_state[anchor_w_key].shape
+        ):
+            child_offsets = (slot_weight[1:] - slot_weight[:1]).reshape(
+                target_state[child_w_key].shape
+            )
+            adapted[child_w_key] = child_offsets
+            copied.append((point_w_key, child_w_key))
+
+        if (
+            child_b_key not in adapted
+            and child_b_key in target_state
+            and slot_bias is not None
+            and slot_bias.shape[0] > 1
+            and slot_bias.shape[1:] == target_state[anchor_b_key].shape
+        ):
+            child_bias_offsets = (slot_bias[1:] - slot_bias[:1]).reshape(
+                target_state[child_b_key].shape
+            )
+            adapted[child_b_key] = child_bias_offsets
+            copied.append((point_b_key, child_b_key))
+
+        if copied and self.rank == 0:
+            logging.info(
+                "Adapted %d pretrained global-point tensors for Gaussian initialization.",
+                len(copied),
+            )
+        return adapted
 
     def _setup_device(self, device: str):
         self.local_rank, self.distributed_rank = get_machine_local_and_dist_rank()
@@ -463,7 +586,7 @@ class Trainer:
         progress_denom = max(self.max_epochs - 1, 1)
 
         for data_iter, batch in enumerate(val_loader):
-            if data_iter > limit_val_batches:
+            if data_iter >= limit_val_batches:
                 break
 
             data_time.update(time.time() - end)
@@ -530,7 +653,7 @@ class Trainer:
             self.gradient_clipper.setup_clipping(self.model)
 
         for data_iter, batch in enumerate(train_loader):
-            if data_iter > limit_train_batches:
+            if data_iter >= limit_train_batches:
                 break
 
             data_time.update(time.time() - end)
@@ -641,7 +764,6 @@ class Trainer:
 
                 loss /= accum_steps
                 self.scaler.scale(loss).backward()
-                loss_meters[loss_key].update(loss.item(), batch_size)
 
     def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
         tensor_keys = ["images", "depths", "extrinsics", "intrinsics", "cam_points", "world_points", "point_masks"]

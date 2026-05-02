@@ -122,7 +122,7 @@ class Stanford2D3DSDataset(BaseDataset):
         """
         cache_dir = osp.join(self.Stanford2D3DS_DIR, 'cache')
         os.makedirs(cache_dir, exist_ok=True)
-        cache_path = osp.join(cache_dir, f"2d3ds_{self.mode}_index.json")
+        cache_path = osp.join(cache_dir, f"2d3ds_{self.mode}_index_v2.json")
 
         def build_fn():
             trajs = self._scan_trajectories_once()
@@ -156,53 +156,95 @@ class Stanford2D3DSDataset(BaseDataset):
                 continue
 
             room_groups_path = osp.join(area_path, '3d', 'room_groups.json')
-            if not osp.exists(room_groups_path):
-                logging.warning(f"room_groups.json not found in {area}")
+            if osp.exists(room_groups_path):
+                try:
+                    with open(room_groups_path, 'r') as f:
+                        room_groups = json.load(f)
+                except Exception as e:
+                    logging.error(f"Error loading room_groups.json from {area}: {e}")
+                    room_groups = None
+
+                if room_groups is not None:
+                    for region_key, region_data in room_groups.items():
+                        region_id = region_data.get('region_id')
+                        room_name = region_data.get('room_name', f'region_{region_id}')
+                        panoramas = region_data.get('panoramas', [])
+
+                        if len(panoramas) < self.min_num_images:
+                            continue
+
+                        # Keep panoramas that have RGB, depth, and pose files.
+                        valid_panoramas = []
+                        for pano_id in panoramas:
+                            rgb_pattern = osp.join(area_path, 'pano', 'rgb',
+                                                   f'camera_{pano_id}_*_frame_equirectangular_domain_rgb.png')
+                            depth_pattern = osp.join(area_path, 'pano', 'depth',
+                                                     f'camera_{pano_id}_*_frame_equirectangular_domain_depth.png')
+                            pose_pattern = osp.join(area_path, 'pano', 'pose',
+                                                    f'camera_{pano_id}_*_frame_equirectangular_domain_pose.json')
+                            if glob.glob(rgb_pattern) and glob.glob(depth_pattern) and glob.glob(pose_pattern):
+                                valid_panoramas.append(pano_id)
+
+                        if len(valid_panoramas) < self.min_num_images:
+                            continue
+
+                        try:
+                            first_pano = valid_panoramas[0]
+                            rgb_pattern = osp.join(area_path, 'pano', 'rgb',
+                                                   f'camera_{first_pano}_*_frame_equirectangular_domain_rgb.png')
+                            rgb_matches = glob.glob(rgb_pattern)
+                            if not rgb_matches:
+                                logging.warning(f"No RGB file found for {first_pano} in {area}/{room_name}")
+                                continue
+                            # Read image resolution from header only.
+                            with Image.open(rgb_matches[0]) as img:
+                                W, H = img.size
+                            resolution = (H, W)
+                            trajectories.append((area, region_id, room_name, valid_panoramas, resolution))
+                        except Exception as e:
+                            logging.warning(f"Error reading header from {area}/{room_name}: {e}")
                 continue
 
-            try:
-                with open(room_groups_path, 'r') as f:
-                    room_groups = json.load(f)
-            except Exception as e:
-                logging.error(f"Error loading room_groups.json from {area}: {e}")
-                continue
-
-            for region_key, region_data in room_groups.items():
-                region_id = region_data.get('region_id')
-                room_name = region_data.get('room_name', f'region_{region_id}')
-                panoramas = region_data.get('panoramas', [])
-
-                if len(panoramas) < self.min_num_images:
+            logging.warning(f"room_groups.json not found in {area}; scanning pano triplets directly")
+            room_to_panos = {}
+            rgb_dir = osp.join(area_path, 'pano', 'rgb')
+            for rgb_path in sorted(glob.glob(osp.join(rgb_dir, 'camera_*_frame_equirectangular_domain_rgb.png'))):
+                name = osp.basename(rgb_path)
+                prefix = 'camera_'
+                suffix = '_frame_equirectangular_domain_rgb.png'
+                if not (name.startswith(prefix) and name.endswith(suffix)):
                     continue
 
-                # Keep panoramas that have RGB, depth, and pose files.
-                valid_panoramas = []
-                for pano_id in panoramas:
-                    rgb_pattern = osp.join(area_path, 'pano', 'rgb',
-                                           f'camera_{pano_id}_*_frame_equirectangular_domain_rgb.png')
-                    depth_pattern = osp.join(area_path, 'pano', 'depth',
-                                             f'camera_{pano_id}_*_frame_equirectangular_domain_depth.png')
-                    pose_pattern = osp.join(area_path, 'pano', 'pose',
-                                            f'camera_{pano_id}_*_frame_equirectangular_domain_pose.json')
-                    if glob.glob(rgb_pattern) and glob.glob(depth_pattern) and glob.glob(pose_pattern):
-                        valid_panoramas.append(pano_id)
+                pano_and_room = name[len(prefix):-len(suffix)]
+                if '_' not in pano_and_room:
+                    continue
+                pano_id, room_name = pano_and_room.split('_', 1)
+                depth_path = osp.join(
+                    area_path, 'pano', 'depth',
+                    f'camera_{pano_id}_{room_name}_frame_equirectangular_domain_depth.png',
+                )
+                pose_path = osp.join(
+                    area_path, 'pano', 'pose',
+                    f'camera_{pano_id}_{room_name}_frame_equirectangular_domain_pose.json',
+                )
+                if osp.exists(depth_path) and osp.exists(pose_path):
+                    room_to_panos.setdefault(room_name, []).append(pano_id)
 
+            for region_id, (room_name, valid_panoramas) in enumerate(sorted(room_to_panos.items())):
                 if len(valid_panoramas) < self.min_num_images:
                     continue
-
                 try:
                     first_pano = valid_panoramas[0]
-                    rgb_pattern = osp.join(area_path, 'pano', 'rgb',
-                                           f'camera_{first_pano}_*_frame_equirectangular_domain_rgb.png')
+                    rgb_pattern = osp.join(
+                        area_path, 'pano', 'rgb',
+                        f'camera_{first_pano}_*_frame_equirectangular_domain_rgb.png',
+                    )
                     rgb_matches = glob.glob(rgb_pattern)
                     if not rgb_matches:
-                        logging.warning(f"No RGB file found for {first_pano} in {area}/{room_name}")
                         continue
-                    # Read image resolution from header only.
                     with Image.open(rgb_matches[0]) as img:
                         W, H = img.size
-                    resolution = (H, W)
-                    trajectories.append((area, region_id, room_name, valid_panoramas, resolution))
+                    trajectories.append((area, region_id, room_name, valid_panoramas, (H, W)))
                 except Exception as e:
                     logging.warning(f"Error reading header from {area}/{room_name}: {e}")
 
@@ -225,6 +267,12 @@ class Stanford2D3DSDataset(BaseDataset):
             ids: list = None,
             aspect_ratio: float = 1.0,
     ) -> dict:
+        if self.sequence_list_len <= 0:
+            raise RuntimeError(
+                f"No Stanford2D3DS trajectories found in {self.Stanford2D3DS_DIR} "
+                f"for areas {self.areas}"
+            )
+
         if self.inside_random:
             seq_index = random.randint(0, self.sequence_list_len - 1)
         if seq_index is None:
@@ -270,8 +318,8 @@ class Stanford2D3DSDataset(BaseDataset):
                     pad = np.random.choice(valid_indices, deficit, replace=self.allow_duplicate_img).tolist()
                     filtered.extend(pad)
                 ids = filtered
-            if len(ids) < 2:
-                ids = np.random.choice(valid_indices, max(2, img_per_seq), replace=self.allow_duplicate_img).tolist()
+            if len(ids) < img_per_seq:
+                ids = np.random.choice(valid_indices, img_per_seq, replace=self.allow_duplicate_img).tolist()
 
         
         base_h, base_w = self.base_resolution
@@ -349,9 +397,12 @@ class Stanford2D3DSDataset(BaseDataset):
                 logging.warning(f"Error processing panorama {area}/{room_name}/{pano_id}: {e}")
                 continue
 
-        # if len(batch_data['images']) < 2:
-        # logging.error(f"Not enough valid frames after processing in {area}/region_{region_id}. Retrying...")
-        # return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
+        if len(batch_data['images']) < img_per_seq:
+            logging.error(
+                f"Only loaded {len(batch_data['images'])}/{img_per_seq} valid frames after processing "
+                f"in {area}/region_{region_id}. Retrying..."
+            )
+            return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         return {
             "seq_name": f"stanford2d3ds_{area}_region{region_id}_{room_name}",
@@ -461,8 +512,7 @@ class Stanford2D3DSDataset(BaseDataset):
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             return (img_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)
         except Exception as e:
-            logging.error(f"Error reading image {path}: {e}")
-            return np.zeros((3, h, w), dtype=np.float32)
+            raise IOError(f"Error reading image {path}: {e}") from e
         
     def _to_single_channel(self, d: np.ndarray) -> np.ndarray:
         """Ensure depth input is a single-channel 2D array of shape (H, W)."""
@@ -497,5 +547,4 @@ class Stanford2D3DSDataset(BaseDataset):
             img[~np.isfinite(img)] = 0.0
             return img[None, ...]
         except Exception as e:
-            logging.error(f"Error reading depth {path}: {e}")
-            return np.zeros((1, h, w), dtype=np.float32)
+            raise IOError(f"Error reading depth {path}: {e}") from e

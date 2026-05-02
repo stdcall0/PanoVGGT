@@ -18,12 +18,16 @@ GAUSSIAN_PREDICTION_KEYS = {
     "gaussian_split_prob",
     "gaussian_split_count",
     "gaussian_token_means",
+    "gaussian_token_mean_anchor",
+    "gaussian_token_mean_residual",
     "gaussian_token_log_scales",
     "gaussian_token_scales",
     "gaussian_token_rotations",
     "gaussian_token_opacity_logits",
     "gaussian_token_opacity",
     "gaussian_token_sh",
+    "gaussian_child_anchor_offsets",
+    "gaussian_child_residual_offsets",
     "gaussian_child_offsets",
     "gaussian_child_log_scales",
     "gaussian_child_scales",
@@ -272,7 +276,9 @@ def save_gaussian_splat_ply(
 
     normals = np.zeros_like(xyz, dtype=np.float32)
     f_dc = sh[:, 0, :].astype(np.float32)
-    f_rest = sh[:, 1:, :].reshape(num_points, -1).astype(np.float32)
+    # GraphDECO-compatible PLY stores SH rest coefficients channel-major:
+    # all red coefficients, then green, then blue.
+    f_rest = sh[:, 1:, :].transpose(0, 2, 1).reshape(num_points, -1).astype(np.float32)
     opacity_logit = _inverse_sigmoid(opacity).astype(np.float32)
     log_scales = np.log(np.clip(scales, 1e-8, None)).astype(np.float32)
 

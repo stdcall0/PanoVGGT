@@ -1,6 +1,6 @@
-torch==2.5.0
-torchvision==0.20.0
-torchaudio==2.5.0
+#torch==2.5.0
+#torchvision==0.20.0
+#torchaudio==2.5.0
 
 numpy
 scipy
@@ -29,12 +29,13 @@ omegaconf
 yacs
 
 tensorboard
+iopath
 
 huggingface-hub
 safetensors
 
 xformers
-gsplat
+#gsplat
 
 # Web / UI
 gradio==5.17.1

@@ -1,11 +1,13 @@
 import ctypes
 import os
+import sys
 import tempfile
 from typing import Optional
 
 
 _ENV_READY_FLAG = "PANOVGGT_GSPLAT_ENV_READY"
 _LIBS_PRELOADED_FLAG = "PANOVGGT_GSPLAT_LIBS_PRELOADED"
+_ARCH_LIST_READY_FLAG = "PANOVGGT_GSPLAT_ARCH_LIST_READY"
 
 
 def _prepend_env_path(name: str, value: str) -> None:
@@ -84,7 +86,55 @@ def preload_conda_runtime_libraries() -> None:
     os.environ[_LIBS_PRELOADED_FLAG] = "1"
 
 
+def configure_gsplat_cuda_arch_list() -> None:
+    if os.environ.get(_ARCH_LIST_READY_FLAG) == "1":
+        return
+
+    current_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    if current_arch_list:
+        unsafe_legacy_arch = False
+        for raw_arch in current_arch_list.replace(" ", ";").split(";"):
+            arch = raw_arch.strip().replace("+PTX", "")
+            if not arch:
+                continue
+            try:
+                major = int(arch.split(".", 1)[0])
+            except ValueError:
+                continue
+            unsafe_legacy_arch = unsafe_legacy_arch or major < 7
+        if not unsafe_legacy_arch:
+            os.environ[_ARCH_LIST_READY_FLAG] = "1"
+            return
+
+    torch_module = sys.modules.get("torch")
+    if torch_module is None:
+        return
+
+    try:
+        if not torch_module.cuda.is_available():
+            return
+        capabilities = {
+            torch_module.cuda.get_device_capability(device_idx)
+            for device_idx in range(torch_module.cuda.device_count())
+        }
+    except Exception:
+        return
+
+    # gsplat 1.5.x uses cooperative_groups::labeled_partition in kernels, which
+    # does not compile for legacy architectures included by PyTorch's default
+    # JIT arch list.  Restrict the JIT build to the actually visible GPUs.
+    capabilities = sorted(cap for cap in capabilities if cap[0] >= 7)
+    if not capabilities:
+        return
+
+    os.environ["TORCH_CUDA_ARCH_LIST"] = ";".join(
+        f"{major}.{minor}" for major, minor in capabilities
+    )
+    os.environ[_ARCH_LIST_READY_FLAG] = "1"
+
+
 def bootstrap_gsplat_runtime(preload_runtime_libs: bool = True) -> None:
     configure_gsplat_build_env()
     if preload_runtime_libs:
         preload_conda_runtime_libraries()
+    configure_gsplat_cuda_arch_list()

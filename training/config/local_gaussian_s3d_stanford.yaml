@@ -1,0 +1,112 @@
+defaults:
+  - gaussian_only
+  - _self_
+
+exp_name: local_gaussian_s3d_stanford
+num_workers: 6
+max_img_per_gpu: 48
+max_img_per_gpu_val: 24
+accum_steps: 2
+val_epoch_freq: 1
+limit_val_batches: 32
+max_epochs: 20
+
+logging:
+  log_dir: outputs
+  all_ranks: False
+
+checkpoint:
+  save_dir: ${logging.log_dir}/${exp_name}/ckpts
+  init_checkpoint_path: checkpoints/model.pt
+  resume_checkpoint_path: null
+  strict: False
+  save_freq: 1
+
+loss:
+  gaussian_render:
+    weight: 0.45
+    cube_dim: 64
+    face_indices: [0, 1, 2, 3, 4, 5]
+    rgb_weight: 1.5
+    depth_weight: 0.04
+    alpha_weight: 0.55
+    opacity_floor: 1e-3
+    fov_degrees: 90.0
+    sh_warmup_start: 0.0
+    sh_warmup_end: 0.35
+    weight_warmup_start: 0.10
+    weight_warmup_end: 0.45
+  gaussian_supervision:
+    center_weight: 0.70
+    scale_weight: 0.35
+    rotation_weight: 0.02
+    opacity_weight: 0.35
+    opacity_target_min: 0.88
+    opacity_target_max: 0.99
+    keep_weight: 0.02
+    split_weight: 0.08
+    sh_weight: 0.20
+    sh_rest_reg_weight: 0.002
+    sh_rest_warmup_start: 0.0
+    sh_rest_warmup_end: 0.35
+    offset_reg_weight: 0.10
+    scale_target_min: 0.10
+    scale_target_max: 0.45
+    scale_target_angular_factor: 1.55
+    scale_under_weight: 4.0
+    scale_over_weight: 0.20
+    scale_floor_weight: 0.35
+    opacity_floor_weight: 0.25
+    split_detail_thresholds: [0.30, 0.55, 0.78]
+    keep_importance_threshold: 0.0
+
+model:
+  gaussian_head:
+    soft_split_training: False
+    max_child_offset: 0.20
+    mean_anchor_scale: 1.0
+    max_mean_residual: 0.10
+    child_anchor_scale: 1.0
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
+          split: train
+          Stanford2D3DS_DIR: /private/codes/exp/chenhang_workspace/homework/dataset/Stanford2D3DS
+          len_train: 4000
+          get_nearby: True
+        - _target_: data.datasets.structured3d.Structured3DDataset
+          split: train
+          Structured3D_DIR: /private/codes/exp/chenhang_workspace/homework/dataset/Structured3D/Structured3D
+          len_train: 4000
+          get_nearby: True
+
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu_val}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
+          split: test
+          Stanford2D3DS_DIR: /private/codes/exp/chenhang_workspace/homework/dataset/Stanford2D3DS
+          len_test: 128
+          get_nearby: False
+        - _target_: data.datasets.structured3d.Structured3DDataset
+          split: test
+          Structured3D_DIR: /private/codes/exp/chenhang_workspace/homework/dataset/Structured3D/Structured3D
+          len_test: 128
+          get_nearby: False

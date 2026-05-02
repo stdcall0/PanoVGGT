@@ -54,6 +54,7 @@ class Structured3DDataset(BaseDataset):
         self.min_num_rooms = min_num_rooms
         self.augmentation = augmentation if augmentation is not None else common_conf.augs
         self.split = split
+        self._bad_room_variants = set()
 
         if split == "train":
             self.dataset_length = len_train
@@ -320,6 +321,9 @@ class Structured3DDataset(BaseDataset):
             for lighting in lightings:
                 rgb_file = osp.join(config_path, f'rgb_{lighting}.png')
                 depth_file = osp.join(config_path, 'depth.png')
+                variant_key = (rgb_file, depth_file)
+                if variant_key in self._bad_room_variants:
+                    continue
                 if osp.exists(rgb_file) and osp.exists(depth_file):
                     return config, lighting, rgb_file, depth_file
 
@@ -384,8 +388,8 @@ class Structured3DDataset(BaseDataset):
         if self.get_nearby:
             ids = self.get_nearby_ids(ids, len(room_data), expand_ratio=self.expand_ratio)
             ids = [int(i) for i in ids if int(i) < len(room_data)]
-            if len(ids) < 2:
-                ids = np.random.choice(len(room_data), max(2, img_per_seq),
+            if len(ids) < img_per_seq:
+                ids = np.random.choice(len(room_data), img_per_seq,
                                        replace=self.allow_duplicate_img).tolist()
 
         # Use fixed training resolution.
@@ -443,10 +447,14 @@ class Structured3DDataset(BaseDataset):
                 successful_ids.append(idx)
             except Exception as e:
                 logging.warning(f"Error processing room {room_id}: {e}")
+                if "rgb_path" in locals() and "depth_path" in locals():
+                    self._bad_room_variants.add((rgb_path, depth_path))
                 continue
 
-        if len(batch_data['images']) < 2:
-            logging.error(f"Not enough valid frames after processing. Retrying...")
+        if len(batch_data['images']) < img_per_seq:
+            logging.error(
+                f"Only loaded {len(batch_data['images'])}/{img_per_seq} valid frames after processing. Retrying..."
+            )
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         return {
@@ -519,8 +527,7 @@ class Structured3DDataset(BaseDataset):
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             return (img_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)  # CHW
         except Exception as e:
-            logging.error(f"Error reading image {path}: {e}")
-            return np.zeros((3, h, w), dtype=np.float32)
+            raise IOError(f"Error reading image {path}: {e}") from e
         
     def _to_single_channel(self, d: np.ndarray) -> np.ndarray:
         """Ensure depth input is a single-channel 2D array of shape (H, W)."""
@@ -552,5 +559,4 @@ class Structured3DDataset(BaseDataset):
             img[~np.isfinite(img)] = 0.0
             return img[None, ...]
         except Exception as e:
-            logging.error(f"Error reading depth {path}: {e}")
-            return np.zeros((1, h, w), dtype=np.float32)
+            raise IOError(f"Error reading depth {path}: {e}") from e

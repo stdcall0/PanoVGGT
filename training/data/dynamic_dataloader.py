@@ -176,6 +176,8 @@ class DynamicBatchSampler(Sampler):
             drop_threshold = 0
         elif self.max_img_per_gpu == 60:
             drop_threshold = 0
+        elif self.max_img_per_gpu == 24:
+            drop_threshold = 0
         elif self.max_img_per_gpu == 192:
             drop_threshold = 4
         else:

@@ -113,19 +113,27 @@ logging:
         - loss_gaussian_sh_rest_reg
         - loss_gaussian_sh_high_order_scale
         - loss_gaussian_offset_reg
+        - loss_gaussian_scale_floor
+        - loss_gaussian_opacity_floor
         - loss_gaussian_render
         - loss_gaussian_render_rgb
         - loss_gaussian_render_depth
         - loss_gaussian_render_alpha
+        - loss_gaussian_render_weight_scale
         - loss_gaussian_target_keep_ratio
         - loss_gaussian_target_importance
+        - loss_gaussian_target_opacity
         - loss_gaussian_pred_keep_prob
+        - loss_gaussian_target_split
+        - loss_gaussian_pred_split
         - loss_gaussian_active_count
         - loss_gaussian_active_ratio
         - loss_gaussian_mean_opacity
         - loss_gaussian_mean_scale
         - loss_gaussian_target_alpha_mean
         - loss_gaussian_render_alpha_mean
+        - loss_gaussian_target_visible_mean
+        - loss_gaussian_render_visible_mean
     val:
       keys_to_log:
         - loss_objective
@@ -148,19 +156,27 @@ logging:
         - loss_gaussian_sh_rest_reg
         - loss_gaussian_sh_high_order_scale
         - loss_gaussian_offset_reg
+        - loss_gaussian_scale_floor
+        - loss_gaussian_opacity_floor
         - loss_gaussian_render
         - loss_gaussian_render_rgb
         - loss_gaussian_render_depth
         - loss_gaussian_render_alpha
+        - loss_gaussian_render_weight_scale
         - loss_gaussian_target_keep_ratio
         - loss_gaussian_target_importance
+        - loss_gaussian_target_opacity
         - loss_gaussian_pred_keep_prob
+        - loss_gaussian_target_split
+        - loss_gaussian_pred_split
         - loss_gaussian_active_count
         - loss_gaussian_active_ratio
         - loss_gaussian_mean_opacity
         - loss_gaussian_mean_scale
         - loss_gaussian_target_alpha_mean
         - loss_gaussian_render_alpha_mean
+        - loss_gaussian_target_visible_mean
+        - loss_gaussian_render_visible_mean
 
 
 checkpoint:
@@ -231,19 +247,19 @@ optim:
   options:
     lr:
       - scheduler:
-          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          _target_: train_utils.param_scheduler.CompositeParamScheduler
           schedulers:
-            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+            - _target_: train_utils.param_scheduler.LinearParamScheduler
               start_value: 1e-8
               end_value: 5e-6
-            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            - _target_: train_utils.param_scheduler.CosineParamScheduler
               start_value: 5e-6
               end_value: 1e-8
           lengths: [0.15, 0.85]
           interval_scaling: ['rescaled', 'rescaled']
     weight_decay:
       - scheduler:
-          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          _target_: train_utils.param_scheduler.ConstantParamScheduler
           value: 0.05
 
 
@@ -273,6 +289,14 @@ model:
     mlp_hidden_dim: 1024
     log_scale_min: -6.0
     log_scale_max: 1.5
+    token_opacity_init: 0.78
+    child_opacity_init: 0.72
+    max_child_offset: 0.25
+    mean_anchor_scale: 1.0
+    max_mean_residual: 0.25
+    child_anchor_scale: 1.0
+    train_min_active_prob: 0.001
+    soft_split_training: False
   aggregator:
     depth: 36
     num_heads: 16

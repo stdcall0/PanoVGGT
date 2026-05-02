@@ -1,8 +1,0 @@
-defaults:
-  - panocity_partial_gaussian_v2_base
-  - _self_
-
-exp_name: panocity_partial_gaussian_v2_scratch
-
-checkpoint:
-  resume_checkpoint_path: null

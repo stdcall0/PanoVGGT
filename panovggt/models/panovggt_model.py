@@ -141,6 +141,14 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         "mlp_hidden_dim": 1024,
         "log_scale_min": -6.0,
         "log_scale_max": 1.5,
+        "token_opacity_init": 0.78,
+        "child_opacity_init": 0.72,
+        "max_child_offset": 0.25,
+        "mean_anchor_scale": 1.0,
+        "max_mean_residual": 0.25,
+        "child_anchor_scale": 1.0,
+        "train_min_active_prob": 0.001,
+        "soft_split_training": False,
     }
 
     def __init__(
@@ -230,6 +238,12 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             self.gaussian_anchor_frame = str(
                 gaussian_head.get("anchor_frame", "first")
             )
+            self.gaussian_train_min_active_prob = float(
+                gaussian_head.get("train_min_active_prob", 0.05)
+            )
+            self.gaussian_soft_split_training = bool(
+                gaussian_head.get("soft_split_training", False)
+            )
             self.gaussian_decoder = ContextTransformerDecoder(
                 in_dim=in_dim_for_decoders,
                 dec_embed_dim=gaussian_head["dec_embed_dim"],
@@ -249,6 +263,12 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 sh_degree=gaussian_head["sh_degree"],
                 log_scale_min=gaussian_head["log_scale_min"],
                 log_scale_max=gaussian_head["log_scale_max"],
+                token_opacity_init=gaussian_head["token_opacity_init"],
+                child_opacity_init=gaussian_head["child_opacity_init"],
+                max_child_offset=gaussian_head["max_child_offset"],
+                mean_anchor_scale=gaussian_head["mean_anchor_scale"],
+                max_mean_residual=gaussian_head["max_mean_residual"],
+                child_anchor_scale=gaussian_head["child_anchor_scale"],
             )
 
         # 4) Absolute spherical position encoding adapters
@@ -295,7 +315,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 in_dim=self.Cpos,
                 out_dim=dim,
                 init_as_identity=True,
-                residual_scale=0.0,
+                residual_scale=0.1,
             )
 
         # Direction vector cache for equirectangular projection
@@ -536,7 +556,10 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                         self.gaussian_keep_threshold if not self.training else None
                     ),
                     use_stage1=self.gaussian_stage1_enabled,
-                    soft_split=self.training,
+                    soft_split=(self.training and self.gaussian_soft_split_training),
+                    min_active_prob=(
+                        self.gaussian_train_min_active_prob if self.training else 1e-4
+                    ),
                 )
 
             predictions.update(stage1_outputs)

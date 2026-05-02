@@ -4,21 +4,18 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from wcmatch import fnmatch
+import fnmatch
 from functools import wraps
 from typing import List
 
 import torch.nn as nn
 
-# ------------------------------------------------------------
-# Glob‑matching flags (behave like the Unix shell) 
-# ------------------------------------------------------------
-GLOB_FLAGS = (
-    fnmatch.CASE       # case‑sensitive
-    | fnmatch.DOTMATCH # '*' also matches '.'
-    | fnmatch.EXTMATCH # extended patterns like *(foo|bar)
-    | fnmatch.SPLIT    # "pat1|pat2" works out‑of‑the‑box
-)
+def _matches(name: str, pattern: str) -> bool:
+    return any(
+        fnmatch.fnmatchcase(name, part)
+        for part in str(pattern).split("|")
+        if part
+    )
 
 
 def freeze_modules(model: nn.Module, patterns: List[str], recursive: bool = True) -> nn.Module:
@@ -47,7 +44,7 @@ def freeze_modules(model: nn.Module, patterns: List[str], recursive: bool = True
 
     for name, mod in model.named_modules():
         # does *name* match ANY user pattern?
-        if any(fnmatch.fnmatch(name, p, flags=GLOB_FLAGS) for p in patterns):
+        if any(_matches(name, p) for p in patterns):
             matched.add(name)
             _freeze(mod, recursive)
 
@@ -89,7 +86,6 @@ def _freeze(mod: nn.Module, recursive: bool) -> None:
 
 
 def _check_every_pattern_used(matched_names: set[str], patterns: List[str]):
-    unused = [p for p in patterns if not any(fnmatch.fnmatch(n, p, flags=GLOB_FLAGS)
-                                             for n in matched_names)]
+    unused = [p for p in patterns if not any(_matches(n, p) for n in matched_names)]
     if unused:
         raise ValueError(f"These patterns matched nothing: {unused}")

@@ -16,24 +16,6 @@ import torch
 import torch.nn as nn
 import os
 from iopath.common.file_io import g_pathmgr
-from wcmatch import fnmatch
-
-
-
-
-
-# ------------------------------------------------------------
-# Glob‑matching flags (behave like the Unix shell) 
-# ------------------------------------------------------------
-GLOB_FLAGS = (
-    fnmatch.CASE       # case‑sensitive
-    | fnmatch.DOTMATCH # '*' also matches '.'
-    | fnmatch.EXTMATCH # extended patterns like *(foo|bar)
-    | fnmatch.SPLIT    # "pat1|pat2" works out‑of‑the‑box
-)
-
-
-
 
 class DDPCheckpointSaver:
     def __init__(

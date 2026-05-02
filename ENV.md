@@ -94,10 +94,10 @@ grep -Ev '^(torch|torchvision|torchaudio|xformers|gsplat)(==|$)' requirements.tx
 pip install -r /tmp/panovggt_requirements_no_torch.txt
 ```
 
-如果后面训练时报缺包，再补这些训练侧依赖：
+如果后面训练时报缺包，再补这个训练侧依赖：
 
 ```bash
-pip install iopath fvcore wcmatch
+pip install iopath
 ```
 
 ### 4.4 在 conda 环境里补 CUDA 编译工具链
@@ -194,7 +194,7 @@ python -c "from panovggt.utils.runtime_env import bootstrap_gsplat_runtime; boot
 所以最稳的启动方式仍然是：
 
 ```bash
-TORCH_NCCL_ASYNC_ERROR_HANDLING=1 torchrun --standalone --nproc_per_node=1 training/launch.py --config panocity_partial_gaussian_v2_base
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1 torchrun --standalone --nproc_per_node=1 training/launch.py --config panocity_gaussian
 ```
 
 ### 6.2 自定义脚本不要先 import torch
@@ -288,7 +288,7 @@ pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 xformers==0.0.3
 
 grep -Ev '^(torch|torchvision|torchaudio|xformers|gsplat)(==|$)' requirements.txt > /tmp/panovggt_requirements_no_torch.txt
 pip install -r /tmp/panovggt_requirements_no_torch.txt
-pip install iopath fvcore wcmatch
+pip install iopath
 
 conda install -y -c nvidia cuda-nvcc=12.8 cuda-toolkit=12.8
 
