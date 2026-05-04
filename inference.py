@@ -17,6 +17,7 @@ import os
 import argparse
 import contextlib
 import glob
+import json
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -292,7 +293,54 @@ def save_ply(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
     print(f"  [ply] saved {N:,} points → {path}")
 
 
-def save_gaussian_artifacts(predictions: dict, output_dir: str) -> Optional[str]:
+def _save_gaussian_metadata(
+    gaussian_dir: str,
+    predictions: dict,
+    flattened: dict,
+    image_paths: List[str],
+    export_sh_degree: int,
+) -> None:
+    means = flattened.get("means")
+    scales = flattened.get("scales")
+    opacity = flattened.get("opacity")
+    sh = flattened.get("sh")
+    metadata = {
+        "coordinate_frame": (
+            "canonical first-panorama OpenCV frame: +X right, +Y down, +Z forward; "
+            "render with identity c2w for the first panorama or cube-face rotations from "
+            "panovggt.utils.gaussian_render"
+        ),
+        "input_images": [Path(p).name for p in image_paths],
+        "export_sh_degree": int(export_sh_degree),
+        "num_splats": int(0 if means is None else means.shape[0]),
+    }
+    if means is not None and means.size:
+        metadata["means_min"] = means.min(axis=0).tolist()
+        metadata["means_max"] = means.max(axis=0).tolist()
+        metadata["means_mean"] = means.mean(axis=0).tolist()
+    if scales is not None and scales.size:
+        metadata["scale_min"] = float(scales.min())
+        metadata["scale_max"] = float(scales.max())
+        metadata["scale_mean"] = float(scales.mean())
+    if opacity is not None and opacity.size:
+        metadata["opacity_min"] = float(opacity.min())
+        metadata["opacity_max"] = float(opacity.max())
+        metadata["opacity_mean"] = float(opacity.mean())
+    if sh is not None and sh.size:
+        rgb = np.clip(sh[:, 0] * 0.28209479177387814 + 0.5, 0.0, 1.0)
+        metadata["dc_rgb_mean"] = rgb.mean(axis=0).tolist()
+        metadata["dc_rgb_std"] = rgb.std(axis=0).tolist()
+
+    with open(os.path.join(gaussian_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def save_gaussian_artifacts(
+    predictions: dict,
+    output_dir: str,
+    image_paths: List[str],
+    export_sh_degree: int = 0,
+) -> Optional[str]:
     if not gaussian_keys_in(predictions):
         return None
 
@@ -308,7 +356,22 @@ def save_gaussian_artifacts(predictions: dict, output_dir: str) -> Optional[str]
         os.path.join(gaussian_dir, "gaussian_centers.ply"), flattened
     )
     save_gaussian_splat_ply(
-        os.path.join(gaussian_dir, "gaussians.ply"), flattened
+        os.path.join(gaussian_dir, "gaussians.ply"),
+        flattened,
+        sh_degree=export_sh_degree,
+    )
+    if export_sh_degree != 3:
+        save_gaussian_splat_ply(
+            os.path.join(gaussian_dir, "gaussians_sh3.ply"),
+            flattened,
+            sh_degree=3,
+        )
+    _save_gaussian_metadata(
+        gaussian_dir,
+        predictions,
+        flattened,
+        image_paths=image_paths,
+        export_sh_degree=export_sh_degree,
     )
     print(
         f"[pipeline] Gaussian artifacts saved ({len(flattened['means']):,} splats) -> {gaussian_dir}"
@@ -398,7 +461,12 @@ def main(args: argparse.Namespace) -> None:
 
     # ── inference ─────────────────────────────────────────────────────────
     preds = run_inference(model, image_paths, device)
-    save_gaussian_artifacts(preds, out_root)
+    save_gaussian_artifacts(
+        preds,
+        out_root,
+        image_paths=image_paths,
+        export_sh_degree=args.gaussian_export_sh_degree,
+    )
 
     # ── unpack predictions ────────────────────────────────────────────────
     # After squeeze, expected shapes:
@@ -574,6 +642,11 @@ def parse_args() -> argparse.Namespace:
                    help="Use logarithmic scale for depth visualisation.")
     p.add_argument("--no_log_depth", dest="log_depth", action="store_false",
                    help="Disable logarithmic depth scale.")
+    p.add_argument("--gaussian_export_sh_degree", type=int, default=0,
+                   choices=[0, 1, 2, 3],
+                   help="SH degree stored in gaussians.ply. Default 0 exports DC-only "
+                        "colors for viewer compatibility; full degree-3 is also saved "
+                        "as gaussians_sh3.ply when this is not 3.")
     return p.parse_args()
 
 

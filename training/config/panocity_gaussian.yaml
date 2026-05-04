@@ -28,25 +28,27 @@ loss:
     weight_warmup_start: 0.10
     weight_warmup_end: 0.45
   gaussian_supervision:
-    center_weight: 0.70
-    scale_weight: 0.35
+    center_weight: 0.85
+    scale_weight: 0.45
     rotation_weight: 0.02
     opacity_weight: 0.35
     opacity_target_min: 0.88
     opacity_target_max: 0.99
     keep_weight: 0.02
     split_weight: 0.08
-    sh_weight: 0.20
-    sh_rest_reg_weight: 0.002
+    sh_weight: 0.35
+    sh_rest_reg_weight: 0.02
     sh_rest_warmup_start: 0.0
     sh_rest_warmup_end: 0.35
-    offset_reg_weight: 0.10
-    scale_target_min: 0.10
-    scale_target_max: 0.45
-    scale_target_angular_factor: 1.55
-    scale_under_weight: 4.0
-    scale_over_weight: 0.20
-    scale_floor_weight: 0.35
+    ray_weight: 0.35
+    ray_behind_weight: 0.25
+    offset_reg_weight: 0.16
+    scale_target_min: 0.004
+    scale_target_max: 0.035
+    scale_target_angular_factor: 0.30
+    scale_under_weight: 0.75
+    scale_over_weight: 4.0
+    scale_floor_weight: 0.0
     opacity_floor_weight: 0.25
     split_detail_thresholds: [0.30, 0.55, 0.78]
     keep_importance_threshold: 0.0
@@ -54,9 +56,11 @@ loss:
 model:
   gaussian_head:
     soft_split_training: False
-    max_child_offset: 0.20
+    log_scale_min: -7.0
+    log_scale_max: -3.0
+    max_child_offset: 0.12
     mean_anchor_scale: 1.0
-    max_mean_residual: 0.10
+    max_mean_residual: 0.06
     child_anchor_scale: 1.0
 
 data:

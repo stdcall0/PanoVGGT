@@ -726,9 +726,11 @@ def unproject_pano_depth_to_camera_coords(depth: torch.Tensor, shape: tuple) -> 
     h, w = shape
     device = depth.device
 
-    # Create spherical coordinates grid
-    v_normalized = torch.arange(h, device=device).float() / (h - 1)
-    u_normalized = torch.arange(w, device=device).float() / (w - 1)
+    # Create spherical coordinates at pixel centers.  This matches the model's
+    # panorama rays and avoids putting the first/last columns exactly on the
+    # seam or the first/last rows exactly on the poles.
+    v_normalized = (torch.arange(h, device=device).float() + 0.5) / h
+    u_normalized = (torch.arange(w, device=device).float() + 0.5) / w
     v_grid, u_grid = torch.meshgrid(v_normalized, u_normalized, indexing='ij')
 
     theta = (u_grid - 0.5) * (2 * math.pi)

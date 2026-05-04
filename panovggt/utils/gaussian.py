@@ -217,6 +217,7 @@ def _inverse_sigmoid(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
 def save_gaussian_splat_ply(
     output_path: str,
     flattened: Dict[str, np.ndarray],
+    sh_degree: Optional[int] = None,
 ) -> None:
     """
     Save Gaussians in the de-facto standard 3DGS PLY layout used by common
@@ -275,6 +276,10 @@ def save_gaussian_splat_ply(
         raise ValueError(f"Expected SH array of shape (N, C, 3), got {sh.shape}")
 
     normals = np.zeros_like(xyz, dtype=np.float32)
+    if sh_degree is not None:
+        max_bases = (int(sh_degree) + 1) ** 2
+        sh = sh[:, :max_bases, :]
+
     f_dc = sh[:, 0, :].astype(np.float32)
     # GraphDECO-compatible PLY stores SH rest coefficients channel-major:
     # all red coefficients, then green, then blue.

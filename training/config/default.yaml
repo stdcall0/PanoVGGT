@@ -112,6 +112,7 @@ logging:
         - loss_gaussian_sh_dc
         - loss_gaussian_sh_rest_reg
         - loss_gaussian_sh_high_order_scale
+        - loss_gaussian_ray
         - loss_gaussian_offset_reg
         - loss_gaussian_scale_floor
         - loss_gaussian_opacity_floor
@@ -155,6 +156,7 @@ logging:
         - loss_gaussian_sh_dc
         - loss_gaussian_sh_rest_reg
         - loss_gaussian_sh_high_order_scale
+        - loss_gaussian_ray
         - loss_gaussian_offset_reg
         - loss_gaussian_scale_floor
         - loss_gaussian_opacity_floor
@@ -287,8 +289,8 @@ model:
     out_dim: 1024
     stage1_hidden_dim: 512
     mlp_hidden_dim: 1024
-    log_scale_min: -6.0
-    log_scale_max: 1.5
+    log_scale_min: -7.0
+    log_scale_max: -3.0
     token_opacity_init: 0.78
     child_opacity_init: 0.72
     max_child_offset: 0.25

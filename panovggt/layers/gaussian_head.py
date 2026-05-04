@@ -204,10 +204,10 @@ class GaussianParameterHead(nn.Module):
     def _init_parameters(self) -> None:
         self._init_linear(self.mean_anchor_head, std=0.0, bias=0.0)
         self._init_linear(self.mean_head, std=1e-3, bias=0.0)
-        # Patch targets in the normalized scene are typically around 0.1-0.3m.
-        # Starting from extremely small Gaussians under-covers cube faces and
-        # leaves the render-alpha loss with weak gradients.
-        self._init_linear(self.log_scale_head, std=1e-3, bias=-1.5)
+        # The Gaussian branch collapses into a foggy solution when the initial
+        # splats are already too large.  Start from a much tighter footprint so
+        # the renderer has to earn coverage from geometry rather than volume.
+        self._init_linear(self.log_scale_head, std=1e-3, bias=math.log(0.01))
         self._init_linear(self.rotation_head, std=1e-3, bias=0.0)
         self._init_linear(
             self.opacity_head, std=1e-3, bias=self._logit(self.token_opacity_init)
@@ -215,7 +215,7 @@ class GaussianParameterHead(nn.Module):
         self._init_linear(self.sh_head, std=1e-3, bias=0.0)
         self._init_linear(self.child_anchor_offset_head, std=0.0, bias=0.0)
         self._init_linear(self.offset_head, std=1e-3, bias=0.0)
-        self._init_linear(self.child_log_scale_head, std=1e-3, bias=-1.6)
+        self._init_linear(self.child_log_scale_head, std=1e-3, bias=math.log(0.008))
         self._init_linear(self.child_rotation_head, std=1e-3, bias=0.0)
         self._init_linear(
             self.child_opacity_head, std=1e-3, bias=self._logit(self.child_opacity_init)

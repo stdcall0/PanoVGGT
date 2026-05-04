@@ -106,18 +106,29 @@ def configure_gsplat_cuda_arch_list() -> None:
             os.environ[_ARCH_LIST_READY_FLAG] = "1"
             return
 
+    default_arch_list = os.environ.get("PANOVGGT_DEFAULT_CUDA_ARCH_LIST", "9.0")
     torch_module = sys.modules.get("torch")
     if torch_module is None:
+        # This bootstrap is often called before importing torch so that gsplat
+        # sees the environment early.  Avoid PyTorch's broad default JIT arch
+        # list, which includes legacy SMs where gsplat's cooperative-groups
+        # kernels do not compile.
+        os.environ["TORCH_CUDA_ARCH_LIST"] = default_arch_list
+        os.environ[_ARCH_LIST_READY_FLAG] = "1"
         return
 
     try:
         if not torch_module.cuda.is_available():
+            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", default_arch_list)
+            os.environ[_ARCH_LIST_READY_FLAG] = "1"
             return
         capabilities = {
             torch_module.cuda.get_device_capability(device_idx)
             for device_idx in range(torch_module.cuda.device_count())
         }
     except Exception:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = default_arch_list
+        os.environ[_ARCH_LIST_READY_FLAG] = "1"
         return
 
     # gsplat 1.5.x uses cooperative_groups::labeled_partition in kernels, which

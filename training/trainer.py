@@ -179,7 +179,11 @@ class Trainer:
         """Loads model/optimizer/scaler from checkpoint with DDP-awareness."""
         logging.info(f"Resuming from {ckpt_path} (rank {self.rank})")
         with g_pathmgr.open(ckpt_path, "rb") as f:
-            checkpoint = torch.load(f, map_location="cpu", weights_only=True)
+            # Training checkpoints include optimizer scheduler metadata that can
+            # contain OmegaConf containers. They are produced locally by this
+            # trainer, so use the full loader for resume instead of PyTorch's
+            # restricted weights-only path.
+            checkpoint = torch.load(f, map_location="cpu", weights_only=False)
 
         model_state_dict = checkpoint.get("model", checkpoint)
 

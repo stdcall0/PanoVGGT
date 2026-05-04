@@ -592,14 +592,16 @@ class GaussianLoss(nn.Module):
         sh_rest_reg_weight: float = 0.002,
         sh_rest_warmup_start: float = 0.0,
         sh_rest_warmup_end: float = 0.35,
+        ray_weight: float = 0.0,
+        ray_behind_weight: float = 0.1,
         offset_reg_weight: float = 0.01,
         opacity_target_min: float = 0.65,
         opacity_target_max: float = 0.95,
-        scale_target_min: float = 0.06,
-        scale_target_max: float = 0.35,
+        scale_target_min: float = 0.006,
+        scale_target_max: float = 0.045,
         scale_target_angular_factor: float = 1.0,
-        scale_under_weight: float = 2.0,
-        scale_over_weight: float = 0.25,
+        scale_under_weight: float = 1.0,
+        scale_over_weight: float = 2.5,
         scale_floor_weight: float = 0.0,
         opacity_floor_weight: float = 0.0,
         split_detail_thresholds: Optional[Sequence[float]] = None,
@@ -624,6 +626,8 @@ class GaussianLoss(nn.Module):
         self.sh_rest_reg_weight = sh_rest_reg_weight
         self.sh_rest_warmup_start = float(sh_rest_warmup_start)
         self.sh_rest_warmup_end = float(sh_rest_warmup_end)
+        self.ray_weight = float(ray_weight)
+        self.ray_behind_weight = float(ray_behind_weight)
         self.offset_reg_weight = offset_reg_weight
         self.opacity_target_min = float(opacity_target_min)
         self.opacity_target_max = float(opacity_target_max)
@@ -693,6 +697,81 @@ class GaussianLoss(nn.Module):
             .reshape(B, N, Hp, Wp, ps * ps, C)
         )
 
+    def _patch_rays(
+        self,
+        image_h: int,
+        image_w: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Patch-center ERP rays in the local OpenCV panorama camera frame."""
+        ps = int(self.patch_size)
+        Hp, Wp = image_h // ps, image_w // ps
+        v = (torch.arange(Hp, device=device, dtype=dtype) + 0.5) * ps
+        u = (torch.arange(Wp, device=device, dtype=dtype) + 0.5) * ps
+        latitude = -(v[:, None] / float(image_h) - 0.5) * math.pi
+        longitude = (u[None, :] / float(image_w) - 0.5) * (2.0 * math.pi)
+        latitude = latitude.expand(Hp, Wp)
+        longitude = longitude.expand(Hp, Wp)
+
+        x = torch.cos(latitude) * torch.sin(longitude)
+        y = -torch.sin(latitude)
+        z = torch.cos(latitude) * torch.cos(longitude)
+        rays = torch.stack([x, y, z], dim=-1)
+        return F.normalize(rays, dim=-1, eps=1e-6)
+
+    def _ray_consistency_loss(
+        self,
+        canonical_points: torch.Tensor,
+        camera_poses: torch.Tensor,
+        patch_valid: torch.Tensor,
+        image_h: int,
+        image_w: int,
+    ) -> torch.Tensor:
+        """Keep predicted centers on the source patch rays after camera transform."""
+        if canonical_points.numel() == 0 or not patch_valid.any().item():
+            return canonical_points.new_tensor(0.0)
+
+        R = camera_poses[..., :3, :3].to(
+            device=canonical_points.device, dtype=canonical_points.dtype
+        )
+        t = camera_poses[..., :3, 3].to(
+            device=canonical_points.device, dtype=canonical_points.dtype
+        )
+        rays = self._patch_rays(
+            image_h,
+            image_w,
+            canonical_points.device,
+            canonical_points.dtype,
+        ).view(1, 1, *canonical_points.shape[2:4], 3)
+
+        if canonical_points.dim() == 5:
+            local_points = torch.einsum(
+                "bsij,bshwj->bshwi",
+                R.transpose(-1, -2),
+                canonical_points - t[:, :, None, None, :],
+            )
+            rays = rays.expand_as(local_points)
+            mask = patch_valid
+        elif canonical_points.dim() == 6:
+            local_points = torch.einsum(
+                "bsij,bshwkj->bshwki",
+                R.transpose(-1, -2),
+                canonical_points - t[:, :, None, None, None, :],
+            )
+            rays = rays.unsqueeze(-2).expand_as(local_points)
+            mask = patch_valid
+        else:
+            raise ValueError(
+                f"Expected canonical_points with 5 or 6 dims, got {canonical_points.shape}"
+            )
+
+        radial = (local_points * rays).sum(dim=-1)
+        cos = radial / local_points.norm(dim=-1).clamp_min(1e-6)
+        angular_loss = (1.0 - cos.clamp(-1.0, 1.0))[mask].mean()
+        behind_loss = F.relu(radial.new_tensor(1e-3) - radial)[mask].mean()
+        return angular_loss + self.ray_behind_weight * behind_loss
+
     def _rotation_loss(
         self,
         pred_quat: torch.Tensor,
@@ -716,7 +795,7 @@ class GaussianLoss(nn.Module):
         pred_log_scales: torch.Tensor,
         target_log_scales: torch.Tensor,
     ) -> torch.Tensor:
-        """Penalize under-sized Gaussians more strongly than over-sized ones."""
+        """Penalize oversized Gaussians strongly to avoid fog-like coverage."""
         zero = pred_log_scales.new_tensor(0.0)
         if pred_log_scales.numel() == 0:
             return zero
@@ -758,6 +837,26 @@ class GaussianLoss(nn.Module):
         angular = max(angular_x, angular_y) * self.scale_target_angular_factor
         radial = means.norm(dim=-1).clamp_min(0.25)
         return (radial * angular).clamp(self.scale_target_min, self.scale_target_max)
+
+    def _fit_log_scales_to_renderable_bounds(
+        self,
+        log_scales: torch.Tensor,
+        scale_floor: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Keep pseudo-Gaussian scale targets renderable.
+
+        Raw patch covariance is dominated by depth discontinuities and surface
+        extent inside a 14x14 ERP patch.  Passing those large anisotropic values
+        directly to gsplat creates opaque slabs that over-composite into a grey
+        fog.  Use covariance only up to a conservative angular footprint.
+        """
+        scale = log_scales.exp()
+        lower = scale_floor.clamp_min(self.scale_target_min)
+        upper = (lower * 1.35).clamp(self.scale_target_min, self.scale_target_max)
+        scale = scale.clamp(min=self.scale_target_min, max=self.scale_target_max)
+        scale = torch.minimum(scale, upper.unsqueeze(-1))
+        return scale.clamp_min(1e-6).log()
 
     def _cov_to_log_scales_rotations(
         self,
@@ -883,6 +982,9 @@ class GaussianLoss(nn.Module):
         log_scales, rotations = self._cov_to_log_scales_rotations(
             cov, patch_valid, scale_floor
         )
+        log_scales = self._fit_log_scales_to_renderable_bounds(
+            log_scales, scale_floor
+        )
 
         slot_ids, slot_rows, slot_cols = self._slot_assignments(global_points.device)
         one_hot = F.one_hot(slot_ids, num_classes=self.max_gaussians_per_token).to(
@@ -926,6 +1028,9 @@ class GaussianLoss(nn.Module):
         )
         slot_log_scales, slot_rotations = self._cov_to_log_scales_rotations(
             slot_cov, slot_valid, slot_scale_floor
+        )
+        slot_log_scales = self._fit_log_scales_to_renderable_bounds(
+            slot_log_scales, slot_scale_floor
         )
 
         rgb_var = (
@@ -1034,6 +1139,7 @@ class GaussianLoss(nn.Module):
         sh_loss = zero
         sh_dc_loss = zero
         sh_rest_reg = zero
+        ray_loss = zero
         offset_reg = zero
         scale_floor_loss = zero
         opacity_floor_loss = zero
@@ -1261,6 +1367,40 @@ class GaussianLoss(nn.Module):
                 )
                 offset_reg = offset_source[patch_valid].norm(dim=-1).mean()
 
+            if self.ray_weight > 0:
+                image_h, image_w = gt["imgs"].shape[-2], gt["imgs"].shape[-1]
+                ray_loss = self._ray_consistency_loss(
+                    pred["gaussian_token_means"],
+                    gt["camera_poses"],
+                    base_valid,
+                    image_h=image_h,
+                    image_w=image_w,
+                )
+                if (
+                    "gaussian_child_offsets" in pred
+                    and pred["gaussian_child_offsets"].numel() > 0
+                ):
+                    child_means = (
+                        pred["gaussian_token_means"].unsqueeze(-2)
+                        + pred["gaussian_child_offsets"]
+                    )
+                    child_ray_mask = patch_valid.unsqueeze(-1).expand(
+                        child_means.shape[:-1]
+                    )
+                    if slot_valid is not None and target["slot_means"].shape[-2] > 1:
+                        child_ray_mask = slot_valid[..., 1:]
+                    if child_ray_mask.any().item():
+                        ray_loss = 0.5 * (
+                            ray_loss
+                            + self._ray_consistency_loss(
+                                child_means,
+                                gt["camera_poses"],
+                                child_ray_mask,
+                                image_h=image_h,
+                                image_w=image_w,
+                            )
+                        )
+
         render_loss = zero
         render_details = {
             "gaussian_render_loss": zero,
@@ -1279,7 +1419,8 @@ class GaussianLoss(nn.Module):
             + self.keep_weight * keep_loss
             + self.split_weight * split_loss
             + self.sh_weight * sh_loss
-            + self.sh_rest_reg_weight * (1.0 - sh_high_order_scale) * sh_rest_reg
+            + self.sh_rest_reg_weight * sh_rest_reg
+            + self.ray_weight * ray_loss
             + self.offset_reg_weight * offset_reg
             + self.scale_floor_weight * scale_floor_loss
             + self.opacity_floor_weight * opacity_floor_loss
@@ -1297,6 +1438,7 @@ class GaussianLoss(nn.Module):
             "gaussian_sh_dc_loss": sh_dc_loss,
             "gaussian_sh_rest_reg": sh_rest_reg,
             "gaussian_sh_high_order_scale": zero.new_tensor(sh_high_order_scale),
+            "gaussian_ray_loss": ray_loss,
             "gaussian_offset_reg": offset_reg,
             "gaussian_scale_floor_loss": scale_floor_loss,
             "gaussian_opacity_floor_loss": opacity_floor_loss,
@@ -1640,6 +1782,7 @@ class Loss(nn.Module):
             'loss_gaussian_sh_dc': as_tensor(gaussian_details.get('gaussian_sh_dc_loss', zero)),
             'loss_gaussian_sh_rest_reg': as_tensor(gaussian_details.get('gaussian_sh_rest_reg', zero)),
             'loss_gaussian_sh_high_order_scale': as_tensor(gaussian_details.get('gaussian_sh_high_order_scale', zero)),
+            'loss_gaussian_ray': as_tensor(gaussian_details.get('gaussian_ray_loss', zero)),
             'loss_gaussian_offset_reg': as_tensor(gaussian_details.get('gaussian_offset_reg', zero)),
             'loss_gaussian_scale_floor': as_tensor(gaussian_details.get('gaussian_scale_floor_loss', zero)),
             'loss_gaussian_opacity_floor': as_tensor(gaussian_details.get('gaussian_opacity_floor_loss', zero)),
