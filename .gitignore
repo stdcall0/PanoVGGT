@@ -51,3 +51,4 @@ skyseg.onnx
 
 # OS
 .DS_Store
+/references/

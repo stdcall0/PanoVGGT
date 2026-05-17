@@ -14,6 +14,7 @@ from panovggt.layers.transformer_head import (
     ContextTransformerDecoder,
 )
 from panovggt.layers.camera_head import CameraHead
+from panovggt.layers.gaussian_head import LinearGaussianHead
 
 
 def _homogenize_points(xyz: torch.Tensor) -> torch.Tensor:
@@ -134,6 +135,10 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         enable_point: bool = True,
         enable_depth: bool = True,
         enable_global_points: bool = True,
+        enable_gaussian: bool = False,
+        gs_sh_degree: int = 1,
+        gs_scale_init: float = 0.01,
+        gs_opacity_init: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -152,6 +157,8 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         self.enable_point = enable_point
         self.enable_depth = enable_depth
         self.enable_global_points = enable_global_points
+        self.enable_gaussian = enable_gaussian
+        self.gs_sh_degree = int(gs_sh_degree)
 
         # 3) Decoder heads
         in_dim_for_decoders = 2 * embed_dim
@@ -189,6 +196,18 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
             )
             self.global_point_head = LinearPts3d(
                 patch_size=self.patch_size, dec_embed_dim=1024, output_dim=3,
+            )
+
+        if self.enable_gaussian:
+            assert self.enable_global_points, (
+                "enable_gaussian=True requires enable_global_points=True; "
+                "the GS head consumes the global decoder hidden state."
+            )
+            self.gaussian_head = LinearGaussianHead(
+                dec_embed_dim=1024,
+                sh_degree=self.gs_sh_degree,
+                scale_init=gs_scale_init,
+                opacity_init=gs_opacity_init,
             )
 
         # 4) Absolute spherical position encoding adapters
@@ -389,10 +408,19 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                     [global_point_hidden[:, patch_start_idx:]], (H, W)
                 ).reshape(B, S, H, W, 3)
             predictions["global_points"] = global_points
+
+            if self.enable_gaussian:
+                # The patch tokens after the register tokens, shape (B*S, Hp*Wp, 1024)
+                gs_tokens = global_point_hidden[:, patch_start_idx:].float()
+                with torch.amp.autocast(device_type="cuda", enabled=False):
+                    gs_params = self.gaussian_head(
+                        gs_tokens, Hp=patch_h, Wp=patch_w, B=B, S=S,
+                    )
+                predictions["gaussian"] = gs_params
         else:
             predictions["global_points"] = None
 
-        if not self.training:
+        if not self.training or self.enable_gaussian:
             predictions["images"] = images
 
         return predictions

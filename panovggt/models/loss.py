@@ -15,6 +15,8 @@ import torch.nn.functional as F
 
 from panovggt.utils.geometry import homogenize_points, se3_inverse, depth_edge
 from panovggt.utils.alignment import align_points_scale
+from panovggt.render.gs_branch import GSBranch
+from panovggt.render.losses import GaussianRenderLoss
 
 
 logger = logging.getLogger(__name__)
@@ -559,19 +561,35 @@ class CameraLoss(nn.Module):
 class Loss(nn.Module):
     """
     Combined Loss for Joint Point and Camera Estimation.
-    
+
     This module combines:
     1. Point loss (local/global points + normal consistency + optional confidence).
     2. Camera pose loss (relative rotation + translation).
-    
+    3. Optional Gaussian render loss when `gs.enabled` is true.
+
     Args:
         train_conf (bool): Whether to train confidence prediction. Default: False.
+        gs (dict|None): Gaussian-branch config. When provided and enabled the
+            module renders the predicted Gaussians and adds a photometric loss.
     """
-    
-    def __init__(self, train_conf: bool = False):
+
+    def __init__(self, train_conf: bool = False, gs: Optional[Dict] = None):
         super().__init__()
         self.point_loss = PointLoss(train_conf=train_conf)
         self.camera_loss = CameraLoss()
+        self.gs_conf = gs or {}
+        self.gs_enabled = bool(self.gs_conf.get("enabled", False))
+        self.gs_branch = None
+        self.gs_loss = None
+        if self.gs_enabled:
+            self.gs_loss = GaussianRenderLoss(
+                rgb_weight=float(self.gs_conf.get("rgb_weight", 1.0)),
+                ssim_weight=float(self.gs_conf.get("ssim_weight", 0.2)),
+                depth_weight=float(self.gs_conf.get("depth_weight", 0.0)),
+            )
+        self._gs_loss_weight = float(self.gs_conf.get("loss_weight", 1.0))
+        self._point_loss_weight = float(self.gs_conf.get("point_loss_weight", 1.0))
+        self._camera_loss_weight = float(self.gs_conf.get("camera_loss_weight", 0.1))
     
     def prepare_gt(self, gt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -682,41 +700,26 @@ class Loss(nn.Module):
         pred: Dict[str, torch.Tensor],
         gt_raw: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """
-        Compute total loss and individual components.
-        
-        Args:
-            pred (dict): Model predictions.
-            gt_raw (dict): Raw ground truth data.
-        
-        Returns:
-            dict: Loss dictionary containing:
-                - loss_objective: Total loss for optimization.
-                - loss_camera: Camera pose loss.
-                - loss_T: Translation loss.
-                - loss_R: Rotation loss.
-                - loss_conf_point: Point confidence loss.
-                - loss_reg_point: Point regression loss.
-                - loss_grad_point: Normal consistency loss.
-                - loss_local_point: Local point loss.
-                - loss_global_point: Global point loss.
-                - loss_conf_depth: Depth confidence loss (unused, set to 0).
-                - loss_reg_depth: Depth regression loss (unused, set to 0).
-                - loss_grad_depth: Depth gradient loss (unused, set to 0).
-        """
         # Prepare ground truth
         gt = self.prepare_gt(gt_raw)
-        
+
         # Normalize predictions
         pred = self.normalize_pred(pred, gt)
-        
+
         # Compute point and camera losses
         point_loss, point_details, scale = self.point_loss(pred, gt)
         cam_loss, cam_details = self.camera_loss(pred, gt, scale)
-        
+
         # Total objective loss
-        loss_objective = point_loss + 0.1 * cam_loss
-        
+        loss_objective = self._point_loss_weight * point_loss + self._camera_loss_weight * cam_loss
+
+        # ---- Gaussian render loss ----------------------------------------
+        gs_total = loss_objective.new_tensor(0.0)
+        gs_details: Dict[str, torch.Tensor] = {}
+        if self.gs_enabled and "gaussian" in pred and pred["gaussian"] is not None:
+            gs_total, gs_details = self._compute_gs_loss(pred, gt)
+            loss_objective = loss_objective + self._gs_loss_weight * gs_total
+
         # Helper to convert to tensor
         def as_tensor(x):
             if isinstance(x, torch.Tensor):
@@ -724,25 +727,18 @@ class Loss(nn.Module):
             return torch.tensor(
                 x, device=loss_objective.device, dtype=loss_objective.dtype
             )
-        
+
         zero = loss_objective.new_tensor(0.0)
-        
+
         # Construct unified loss dictionary
         loss_dict = {
-            # Total objective
             'loss_objective': loss_objective,
-            
-            # Camera losses
             'loss_camera': as_tensor(cam_loss),
             'loss_T': as_tensor(cam_details.get('trans_loss', zero)),
             'loss_R': as_tensor(cam_details.get('rot_loss', zero)),
-            
-            # Depth losses (not currently used, set to zero)
             'loss_conf_depth': zero,
             'loss_reg_depth': zero,
             'loss_grad_depth': zero,
-            
-            # Point losses
             'loss_conf_point': as_tensor(point_details.get('local_conf_loss', zero)),
             'loss_reg_point': (
                 as_tensor(point_details.get('local_pts_loss', zero)) +
@@ -751,6 +747,93 @@ class Loss(nn.Module):
             'loss_grad_point': as_tensor(point_details.get('normal_loss', zero)),
             'loss_local_point': as_tensor(point_details.get('local_pts_loss', zero)),
             'loss_global_point': as_tensor(point_details.get('global_pts_loss', zero)),
+            # GS-branch loss components (zero when disabled)
+            'loss_gs': as_tensor(gs_total),
+            'loss_gs_rgb': as_tensor(gs_details.get('rgb_l1', zero)),
+            'loss_gs_ssim': as_tensor(gs_details.get('ssim', zero)),
+            'loss_gs_depth': as_tensor(gs_details.get('depth_l1', zero)),
         }
-        
+
         return loss_dict
+
+    # ------------------------------------------------------------------
+    def _build_gs_branch(self, equ_h: int, sh_degree: int):
+        """Lazily build the GSBranch once we know image dimensions."""
+        gs_conf = self.gs_conf
+        self.gs_branch = GSBranch(
+            renderer=str(gs_conf.get("renderer", "cube")),
+            equ_h=int(equ_h),
+            face_res=int(gs_conf.get("face_res", 256)),
+            fov_deg=float(gs_conf.get("fov_deg", 95.0)),
+            boundary_px=int(gs_conf.get("boundary_px", 4)),
+            sh_degree=int(sh_degree),
+            scale_init_mode=str(gs_conf.get("scale_init_mode", "depth_footprint")),
+            scale_init_value=float(gs_conf.get("scale_init_value", 0.01)),
+            use_offset=bool(gs_conf.get("use_offset", False)),
+            detach_centers=bool(gs_conf.get("detach_centers", True)),
+            detach_camera=bool(gs_conf.get("detach_camera", True)),
+            train_dc=bool(gs_conf.get("train_dc", True)),
+            train_opacity=bool(gs_conf.get("train_opacity", True)),
+            train_scale=bool(gs_conf.get("train_scale", False)),
+            train_rotation=bool(gs_conf.get("train_rotation", False)),
+            train_sh_rest=bool(gs_conf.get("train_sh_rest", False)),
+        )
+
+    def _compute_gs_loss(self, pred: Dict[str, torch.Tensor], gt: Dict[str, torch.Tensor]):
+        """Render the predicted Gaussians and compute photometric loss."""
+        world_points = pred["world_points"]            # (B,S,H,W,3) — normalized cam0-frame
+        camera_poses = pred["camera_poses"]            # (B,S,4,4) c2w — normalized
+        depth_pred = pred.get("depth", None)           # (B,S,H,W,1)
+        gs_params = pred["gaussian"]
+        images = pred.get("images", gt.get("imgs"))    # (B,S,3,H,W)
+        B, S, H, W, _ = world_points.shape
+
+        sh_dim = gs_params["sh_rest"].shape[-1]        # 3*sh_extra/3 = sh_extra
+        # Recover sh_degree from rest dim (sh_extra = (deg+1)^2 - 1)
+        sh_extra = sh_dim
+        from math import isqrt
+        deg = isqrt(sh_extra + 1) - 1 if sh_extra > 0 else 0
+
+        if self.gs_branch is None or self.gs_branch.renderer.equ_h != H:
+            self._build_gs_branch(equ_h=H, sh_degree=deg)
+            self.gs_branch.renderer.to(world_points.device)
+        else:
+            self.gs_branch.renderer.to(world_points.device)
+
+        out = self.gs_branch.render(
+            gs_params=gs_params,
+            world_points=world_points,
+            camera_poses_c2w=camera_poses,
+            images=images,
+            depth=depth_pred,
+        )
+
+        rgb_pred = out["rgb_erp"].reshape(B * S, 3, H, W)
+        depth_render = out["depth_erp"].reshape(B * S, 1, H, W)
+        mask = out["mask_erp"].reshape(B * S, 1, H, W)
+
+        rgb_gt = images.reshape(B * S, 3, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+
+        depth_gt = gt.get("depths", None)
+        depth_mask = gt.get("valid_masks", None)
+        if depth_gt is not None:
+            if depth_gt.dim() == 5:
+                depth_gt = depth_gt
+            depth_gt = depth_gt.reshape(B * S, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+        if depth_mask is not None:
+            depth_mask = depth_mask.reshape(B * S, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+
+        # Combine the boundary/cube mask with the GT validity mask if present.
+        if depth_mask is not None:
+            mask_full = mask * depth_mask
+        else:
+            mask_full = mask
+
+        return self.gs_loss(
+            rgb_pred=rgb_pred,
+            rgb_gt=rgb_gt,
+            mask=mask_full,
+            depth_pred=depth_render,
+            depth_gt=depth_gt,
+            depth_mask=mask_full if depth_gt is not None else None,
+        )

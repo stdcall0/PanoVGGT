@@ -1,0 +1,79 @@
+# @package _global_
+# Stage B — multi-scene generalization on color + opacity only.
+# Same trainable set as Stage A but no overfit-one switch.
+
+defaults:
+  - /default
+  - _self_
+
+exp_name: gs_stage_b
+
+model:
+  enable_global_points: True
+  enable_gaussian: True
+  gs_sh_degree: 0
+  gs_scale_init: 0.01
+  gs_opacity_init: 0.1
+
+loss:
+  _target_: panovggt.models.loss.Loss
+  train_conf: ${model.train_conf}
+  gs:
+    enabled: True
+    renderer: cube
+    face_res: 256
+    fov_deg: 95.0
+    boundary_px: 4
+    scale_init_mode: depth_footprint
+    scale_init_value: 0.01
+    use_offset: False
+    detach_centers: True
+    detach_camera: True
+    train_dc: True
+    train_opacity: True
+    train_scale: False
+    train_rotation: False
+    train_sh_rest: False
+    rgb_weight: 1.0
+    ssim_weight: 0.2
+    depth_weight: 0.0
+    loss_weight: 1.0
+    point_loss_weight: 1.0
+    camera_loss_weight: 0.1
+
+optim:
+  frozen_module_names:
+    - "aggregator"
+    - "point_decoder"
+    - "point_head"
+    - "global_points_decoder"
+    - "global_point_head"
+    - "camera_decoder"
+    - "camera_head"
+    - "gaussian_head.offset"
+    - "gaussian_head.scale"
+    - "gaussian_head.rotation"
+    - "gaussian_head.sh_rest"
+
+logging:
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_gs
+        - loss_gs_rgb
+        - loss_gs_ssim
+        - loss_gs_depth
+        - loss_camera
+        - loss_local_point
+        - loss_global_point
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_gs
+        - loss_gs_rgb
+        - loss_gs_ssim
+        - loss_gs_depth
+        - loss_camera
+        - loss_local_point
+        - loss_global_point

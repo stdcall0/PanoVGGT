@@ -38,11 +38,11 @@ _INPUT_W = 1036
 #  1.  Model Loading
 # =========================================================================
 
-def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTModel:
+def load_model(config_path: str, checkpoint_path: str, device: str, enable_gaussian: bool = False) -> PanoVGGTModel:
     cfg = OmegaConf.load(config_path)
     OmegaConf.resolve(cfg)
     mc = cfg.model
-    model = PanoVGGTModel(
+    model_kwargs = dict(
         img_size=cfg.img_size,
         patch_size=cfg.patch_size,
         embed_dim=cfg.embed_dim,
@@ -51,6 +51,15 @@ def load_model(config_path: str, checkpoint_path: str, device: str) -> PanoVGGTM
         enable_point=mc.enable_point,
         aggregator=OmegaConf.to_container(mc.aggregator, resolve=True),
     )
+    if enable_gaussian or bool(getattr(mc, "enable_gaussian", False)):
+        model_kwargs["enable_global_points"] = True
+        model_kwargs["enable_gaussian"] = True
+        model_kwargs["gs_sh_degree"] = int(getattr(mc, "gs_sh_degree", 1))
+        model_kwargs["gs_scale_init"] = float(getattr(mc, "gs_scale_init", 0.01))
+        model_kwargs["gs_opacity_init"] = float(getattr(mc, "gs_opacity_init", 0.1))
+    elif "enable_global_points" in mc:
+        model_kwargs["enable_global_points"] = bool(mc.enable_global_points)
+    model = PanoVGGTModel(**model_kwargs)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     for key in ("model_state_dict", "model", "state_dict"):
         if key in ckpt:
@@ -297,6 +306,11 @@ def run_inference(
             if v_cpu.dim() >= 1 and v_cpu.shape[0] == 1:
                 v_cpu = v_cpu.squeeze(0)
             out[k] = v_cpu.numpy()
+        elif isinstance(v, dict):
+            out[k] = {
+                kk: (vv.float().cpu() if isinstance(vv, torch.Tensor) else vv)
+                for kk, vv in v.items()
+            }
         else:
             out[k] = v
 
@@ -333,7 +347,8 @@ def main(args: argparse.Namespace) -> None:
         print(f"[pipeline] {n_masks}/{S} mask(s) matched.")
 
     # ── model ─────────────────────────────────────────────────────────────
-    model = load_model(args.config, args.checkpoint, device)
+    enable_gaussian = bool(getattr(args, "enable_gaussian", False) or getattr(args, "gs_ply", None))
+    model = load_model(args.config, args.checkpoint, device, enable_gaussian=enable_gaussian)
     model.eval().to(device)
     print(f"[pipeline] Model ready on {device}.")
     print(f"[pipeline] Fixed input resolution: H={_INPUT_H}, W={_INPUT_W}")
@@ -484,6 +499,33 @@ def main(args: argparse.Namespace) -> None:
         )
         print(f"[pipeline] All poses ({S}) saved → {pose_dir}/all_poses.npy")
 
+    # ── GS export ─────────────────────────────────────────────────────────
+    if enable_gaussian and "gaussian" in preds and preds["gaussian"] is not None:
+        gs_path = args.gs_ply or os.path.join(out_root, "gaussians.ply")
+        gs_dict = preds["gaussian"]
+        # bring world_points back as a torch tensor with batch dim for aggregator
+        wp = preds.get("world_points")
+        if isinstance(wp, np.ndarray):
+            wp_t = torch.from_numpy(wp).unsqueeze(0)
+        else:
+            wp_t = wp.unsqueeze(0) if wp.dim() == 4 else wp
+        wrap = {
+            "gaussian": {k: v.unsqueeze(0) for k, v in gs_dict.items()},
+            "world_points": wp_t,
+        }
+        from panovggt.utils.gs_export import aggregate_predictions, gs_to_ply
+        agg = aggregate_predictions(wrap, sh_degree=int(getattr(model, "gs_sh_degree", 1)))
+        gs_to_ply(
+            means=agg["means"],
+            scales=agg["scales"],
+            rotations=agg["rotations"],
+            opacities=agg["opacities"],
+            sh_dc=agg["sh_dc"],
+            sh_rest=agg["sh_rest"],
+            out_path=gs_path,
+        )
+        print(f"[gs] aggregated {agg['means'].shape[0]:,} Gaussians → {gs_path}")
+
     print(f"\n✅ Done.  Results written to: {out_root}")
 
 
@@ -515,6 +557,10 @@ def parse_args() -> argparse.Namespace:
                    help="Use logarithmic scale for depth visualisation.")
     p.add_argument("--no_log_depth", dest="log_depth", action="store_false",
                    help="Disable logarithmic depth scale.")
+    p.add_argument("--enable_gaussian", action="store_true",
+                   help="Enable the GS branch and export the predicted Gaussians.")
+    p.add_argument("--gs_ply", type=str, default=None,
+                   help="Output path for the aggregated 3DGS .ply (implies --enable_gaussian).")
     return p.parse_args()
 
 
