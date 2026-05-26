@@ -590,6 +590,9 @@ class Loss(nn.Module):
         self._gs_loss_weight = float(self.gs_conf.get("loss_weight", 1.0))
         self._point_loss_weight = float(self.gs_conf.get("point_loss_weight", 1.0))
         self._camera_loss_weight = float(self.gs_conf.get("camera_loss_weight", 0.1))
+        self._gs_photometric_mode = str(self.gs_conf.get("photometric_mode", "source_recon"))
+        self._gs_target_policy = str(self.gs_conf.get("target_policy", "last"))
+        self._gs_num_target_views = int(self.gs_conf.get("num_target_views", 1))
     
     def prepare_gt(self, gt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -814,6 +817,56 @@ class Loss(nn.Module):
         if not torch.allclose(camera_poses[:, 0], eye.expand(B, 4, 4), atol=1e-3, rtol=1e-3):
             raise ValueError("GS camera poses must be first-frame-relative; pose[:,0] is not identity.")
 
+        mode = self._gs_photometric_mode.lower()
+        if mode in ("source_recon", "reconstruction", "observed"):
+            source_idx = target_idx = torch.arange(S, device=world_points.device)
+        elif mode in ("novel_view", "nvs", "source_target"):
+            if S < 2:
+                raise ValueError("GS novel_view loss requires at least 2 views in each sample.")
+            if self._gs_num_target_views < 1 or self._gs_num_target_views >= S:
+                raise ValueError(
+                    "num_target_views must be in [1, S-1] for novel_view GS loss, "
+                    f"got {self._gs_num_target_views} with S={S}."
+                )
+            target_idx = self._select_gs_target_indices(S, world_points.device)
+            source_mask = torch.ones(S, dtype=torch.bool, device=world_points.device)
+            source_mask[target_idx] = False
+            source_idx = torch.arange(S, device=world_points.device)[source_mask]
+        else:
+            raise ValueError(
+                "Unknown GS photometric_mode "
+                f"'{self._gs_photometric_mode}'. Use 'source_recon' or 'novel_view'."
+            )
+
+        def select_views(x: Optional[torch.Tensor], idx: torch.Tensor):
+            if x is None:
+                return None
+            return x.index_select(1, idx)
+
+        def select_gs_params(params: Dict[str, torch.Tensor], idx: torch.Tensor):
+            selected = {}
+            for key, value in params.items():
+                if isinstance(value, torch.Tensor):
+                    if value.dim() < 2 or value.shape[1] != S:
+                        raise ValueError(
+                            f"Gaussian param '{key}' must have source-view dim S={S}; "
+                            f"got {tuple(value.shape)}."
+                        )
+                    selected[key] = value.index_select(1, idx)
+                else:
+                    selected[key] = value
+            return selected
+
+        source_world_points = select_views(world_points, source_idx)
+        source_depth_pred = select_views(depth_pred, source_idx)
+        source_images = select_views(images, source_idx)
+        source_gs_params = select_gs_params(gs_params, source_idx)
+        render_camera_poses = select_views(camera_poses, target_idx)
+        target_images = select_views(images, target_idx)
+        target_depths = select_views(gt.get("depths", None), target_idx)
+        target_masks = select_views(gt.get("valid_masks", None), target_idx)
+        T = int(target_idx.numel())
+
         sh_dim = gs_params["sh_rest"].shape[-1]        # 3*sh_extra/3 = sh_extra
         # Recover sh_degree from rest dim (sh_extra = (deg+1)^2 - 1)
         sh_extra = sh_dim
@@ -827,27 +880,27 @@ class Loss(nn.Module):
             self.gs_branch.renderer.to(world_points.device)
 
         out = self.gs_branch.render(
-            gs_params=gs_params,
-            world_points=world_points,
-            camera_poses_c2w=camera_poses,
-            images=images,
-            depth=depth_pred,
+            gs_params=source_gs_params,
+            world_points=source_world_points,
+            camera_poses_c2w=render_camera_poses,
+            images=source_images,
+            depth=source_depth_pred,
         )
 
-        rgb_pred = out["rgb_erp"].reshape(B * S, 3, H, W)
-        depth_render = out["depth_erp"].reshape(B * S, 1, H, W)
-        mask = out["mask_erp"].reshape(B * S, 1, H, W)
+        rgb_pred = out["rgb_erp"].reshape(B * T, 3, H, W)
+        depth_render = out["depth_erp"].reshape(B * T, 1, H, W)
+        mask = out["mask_erp"].reshape(B * T, 1, H, W)
 
-        rgb_gt = images.reshape(B * S, 3, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+        rgb_gt = target_images.reshape(B * T, 3, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
 
-        depth_gt = gt.get("depths", None)
-        depth_mask = gt.get("valid_masks", None)
+        depth_gt = target_depths
+        depth_mask = target_masks
         if depth_gt is not None:
             if depth_gt.dim() == 5:
                 depth_gt = depth_gt
-            depth_gt = depth_gt.reshape(B * S, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+            depth_gt = depth_gt.reshape(B * T, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
         if depth_mask is not None:
-            depth_mask = depth_mask.reshape(B * S, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+            depth_mask = depth_mask.reshape(B * T, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
 
         # Combine the boundary/cube mask with the GT validity mask if present.
         if depth_mask is not None:
@@ -863,3 +916,23 @@ class Loss(nn.Module):
             depth_gt=depth_gt,
             depth_mask=mask_full if depth_gt is not None else None,
         )
+
+    def _select_gs_target_indices(self, num_views: int, device: torch.device) -> torch.Tensor:
+        count = self._gs_num_target_views
+        policy = self._gs_target_policy.lower()
+        if policy == "first":
+            target_idx = torch.arange(count, device=device)
+        elif policy == "last":
+            target_idx = torch.arange(num_views - count, num_views, device=device)
+        elif policy == "random":
+            if self.training:
+                target_idx = torch.randperm(num_views, device=device)[:count]
+                target_idx = target_idx.sort().values
+            else:
+                target_idx = torch.arange(num_views - count, num_views, device=device)
+        else:
+            raise ValueError(
+                f"Unknown GS target_policy '{self._gs_target_policy}'. "
+                "Use 'first', 'last', or 'random'."
+            )
+        return target_idx

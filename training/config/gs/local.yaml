@@ -1,16 +1,12 @@
 # @package _global_
-# Stage D — local 8x H200 run.
-# Trains ONLY the Gaussian head; the rest of the model (aggregator + heads)
-# is loaded from checkpoints/model.pt and frozen.
-# Datasets are read from ./dataset (Matterport3D excluded — not ready locally).
+# Local full-GS training with the original source-view reconstruction render loss.
 
 defaults:
   - /default
   - _self_
 
-exp_name: gs_stage_d_local
+exp_name: gs_local
 
-# ---- model: enable GS branch (full Stage D config) -------------------------
 model:
   enable_global_points: True
   enable_gaussian: True
@@ -18,13 +14,12 @@ model:
   gs_scale_init: 0.01
   gs_opacity_init: 0.1
 
-
-# ---- loss: Stage D GS render loss ------------------------------------------
 loss:
   _target_: panovggt.models.loss.Loss
   train_conf: ${model.train_conf}
   gs:
     enabled: True
+    photometric_mode: source_recon
     renderer: cube
     face_res: 512
     fov_deg: 95.0
@@ -32,7 +27,7 @@ loss:
     scale_init_mode: depth_footprint
     scale_init_value: 0.01
     use_offset: True
-    detach_centers: True       # backbone is frozen, no gradient flow back
+    detach_centers: True
     detach_camera: True
     train_dc: True
     train_opacity: True
@@ -43,11 +38,9 @@ loss:
     ssim_weight: 0.2
     depth_weight: 0.05
     loss_weight: 1.0
-    point_loss_weight: 0.0     # backbone frozen; skip ancillary losses
+    point_loss_weight: 0.0
     camera_loss_weight: 0.0
 
-
-# ---- optim: freeze ALL non-GS modules --------------------------------------
 optim:
   frozen_module_names:
     - "aggregator"
@@ -69,21 +62,14 @@ optim:
         max_norm: 1.0
         norm_type: 2
 
-
-# ---- checkpointing: warm-start non-GS weights from base model.pt -----------
-# resume_checkpoint_path is null in config; the launcher script overrides it
-# to ./checkpoints/model.pt on the first run, then lets get_resume_checkpoint()
-# auto-resume from save_dir/checkpoint.pt on subsequent loop iterations.
 checkpoint:
-  save_dir: ./outputs/gs_stage_d_local/ckpts
+  save_dir: ./outputs/gs_local/ckpts
   save_freq: 5
   resume_checkpoint_path: null
   strict: False
 
-
-# ---- logging: local paths --------------------------------------------------
 logging:
-  log_dir: ./outputs/gs_stage_d_local
+  log_dir: ./outputs/gs_local
   log_exp: ${exp_name}
   log_visuals: False
   log_freq: 1
@@ -109,13 +95,6 @@ logging:
         - loss_gs_ssim
         - loss_gs_depth
 
-
-# ---- datasets: local ./dataset paths ---------------------------------------
-# Matterport3D scene parsing is in progress; the loader will skip any scene in
-# train.txt that doesn't yet have a parsed_json entry, so it's safe to enable.
-# If new scenes are processed later, delete
-# ./dataset/Matterport3D/processed/cache/matterport3d_*_index.json before launch
-# so the index is rebuilt.
 data:
   train:
     dataset:

@@ -1,0 +1,20 @@
+# @package _global_
+# Local full-GS training with source-to-target novel-view render loss.
+
+defaults:
+  - local
+  - _self_
+
+exp_name: gs_local_da3_loss
+
+loss:
+  gs:
+    photometric_mode: novel_view
+    target_policy: random
+    num_target_views: 1
+
+checkpoint:
+  save_dir: ./outputs/gs_local_da3_loss/ckpts
+
+logging:
+  log_dir: ./outputs/gs_local_da3_loss
