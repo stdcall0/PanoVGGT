@@ -16,8 +16,6 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-from gsplat import rasterization
-
 from .cube_to_equi import Cube2Equirec, opencv_face_rotations
 
 
@@ -70,6 +68,20 @@ class CubePanoRenderer(nn.Module):
             face_w=face_res, equ_h=equ_h, equ_w=self.equ_w, fov_deg=fov_deg
         )
         self.register_buffer("face_R", opencv_face_rotations())  # (6, 3, 3)
+        self._rasterization = None
+
+    def _load_rasterization(self):
+        if self._rasterization is None:
+            try:
+                from gsplat import rasterization
+            except Exception as exc:
+                raise ImportError(
+                    "CubePanoRenderer requires the optional `gsplat` package. "
+                    "Install it with `pip install gsplat`, or disable GS loss / "
+                    "choose a renderer that is available in this environment."
+                ) from exc
+            self._rasterization = rasterization
+        return self._rasterization
 
     def reset(self, equ_h: int, face_res: int):
         """Rebuild the cube↔equi grid (used when stage changes face_res)."""
@@ -158,6 +170,7 @@ class CubePanoRenderer(nn.Module):
             )
         )
 
+        rasterization = self._load_rasterization()
         rgb, alpha, _info = rasterization(
             means=means,
             quats=quats,

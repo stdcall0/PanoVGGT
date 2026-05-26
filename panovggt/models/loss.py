@@ -139,7 +139,7 @@ class PointLoss(nn.Module):
         self.local_align_res = local_align_res
         self.train_conf = train_conf
         self.expected_dist_thresh = expected_dist_thresh
-        
+
         # Loss functions
         self.criteria_local = nn.L1Loss(reduction='none')
         if self.train_conf:
@@ -153,18 +153,18 @@ class PointLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Sample fixed number of valid points for robust scale estimation.
-        
+
         Args:
             pts (torch.Tensor): Points of shape [B, N, H, W, C].
             mask (torch.Tensor): Valid mask of shape [B, N, H, W].
             target_size (int): Number of points to sample.
-        
+
         Returns:
             torch.Tensor: Sampled points of shape [B, target_size, C].
         """
         B, N, H, W, C = pts.shape
         output = []
-        
+
         for i in range(B):
             valid_pts = pts[i][mask[i]]  # [M, C]
             
@@ -655,6 +655,9 @@ class Loss(nn.Module):
         masks = gt['valid_masks']
         
         B, N, H, W, _ = local_points.shape
+        pred['camera_poses_original'] = camera_poses
+        if 'world_points' in pred and pred['world_points'] is not None:
+            pred['world_points_original'] = pred['world_points']
         
         # Compute normalization scale from local points
         all_pts = local_points.clone()
@@ -662,36 +665,49 @@ class Loss(nn.Module):
         all_pts = all_pts.reshape(B, N, -1, 3)
         all_dis = all_pts.norm(dim=-1)
         denom = masks.float().sum(dim=[-1, -2, -3]).clamp(min=1e-8)
-        norm_factor = all_dis.sum(dim=[-1, -2]) / denom  # [B]
-        
+        norm_factor = all_dis.sum(dim=(1, 2)) / denom  # [B]
+
         scale = norm_factor.view(B, 1, 1, 1, 1)
-        
+
         # Normalize local points
         pred['local_points'] = local_points / scale
-        
-        # Normalize global points if present
-        if 'global_points' in pred and pred['global_points'] is not None:
-            global_points = pred['global_points']
-            
-            # Transform to first camera coordinate system
-            R0 = camera_poses[:, 0, :3, :3]  # [B, 3, 3]
-            t0 = camera_poses[:, 0, :3, 3]   # [B, 3]
-            
-            # Compute w2c translation: t_w2c = -(t_c2w @ R_c2w)
-            t_w2c = -torch.matmul(t0.unsqueeze(-2), R0).squeeze(-2)  # [B, 3]
-            
-            # Transform: x_cam0 = x_world @ R0 + t_w2c
-            global_points_cam0 = torch.matmul(
-                global_points,
+        if 'depth' in pred and pred['depth'] is not None:
+            pred['depth_original'] = pred['depth']
+            pred['depth'] = pred['depth'] / scale
+
+        # Transform world-like predictions to the same normalized cam0 frame.
+        R0 = camera_poses[:, 0, :3, :3]  # [B, 3, 3]
+        t0 = camera_poses[:, 0, :3, 3]   # [B, 3]
+        t_w2c = -torch.matmul(t0.unsqueeze(-2), R0).squeeze(-2)  # [B, 3]
+
+        def normalize_world_like(points: torch.Tensor) -> torch.Tensor:
+            points_cam0 = torch.matmul(
+                points,
                 R0.unsqueeze(1).unsqueeze(2)
             ) + t_w2c.view(B, 1, 1, 1, 3)
-            
-            pred['global_points'] = global_points_cam0 / scale
+            return points_cam0 / scale
+
+        if 'global_points' in pred and pred['global_points'] is not None:
+            pred['global_points'] = normalize_world_like(pred['global_points'])
+        if 'world_points' in pred and pred['world_points'] is not None:
+            pred['world_points'] = normalize_world_like(pred['world_points'])
+            pred['gs_world_points'] = pred['world_points']
         
         # Normalize camera translations
         camera_poses_normalized = camera_poses.clone()
         camera_poses_normalized[..., :3, 3] /= norm_factor.view(B, 1, 1)
         pred['camera_poses'] = camera_poses_normalized
+        pred['norm_factor'] = norm_factor
+
+        # Camera poses for GS rendering live in normalized cam0 coordinates.
+        # The first view is identity, and other views are target-camera poses
+        # relative to cam0 with translations divided by the same norm_factor.
+        c2w0 = camera_poses[:, :1]
+        cam0_w2c = se3_inverse(c2w0)
+        gs_camera_poses = cam0_w2c @ camera_poses
+        gs_camera_poses = gs_camera_poses.clone()
+        gs_camera_poses[..., :3, 3] /= norm_factor.view(B, 1, 1)
+        pred['gs_camera_poses'] = gs_camera_poses
         
         return pred
     
@@ -781,12 +797,22 @@ class Loss(nn.Module):
 
     def _compute_gs_loss(self, pred: Dict[str, torch.Tensor], gt: Dict[str, torch.Tensor]):
         """Render the predicted Gaussians and compute photometric loss."""
-        world_points = pred["world_points"]            # (B,S,H,W,3) — normalized cam0-frame
-        camera_poses = pred["camera_poses"]            # (B,S,4,4) c2w — normalized
+        if "gs_world_points" not in pred or "gs_camera_poses" not in pred:
+            raise KeyError("GS loss requires normalized `gs_world_points` and `gs_camera_poses`.")
+        world_points = pred["gs_world_points"]         # (B,S,H,W,3), normalized cam0 frame
+        camera_poses = pred["gs_camera_poses"]         # (B,S,4,4), c2w in normalized cam0 frame
         depth_pred = pred.get("depth", None)           # (B,S,H,W,1)
         gs_params = pred["gaussian"]
         images = pred.get("images", gt.get("imgs"))    # (B,S,3,H,W)
         B, S, H, W, _ = world_points.shape
+        if world_points.shape[:4] != camera_poses.shape[:2] + (H, W):
+            raise ValueError(
+                "GS coordinate contract violated: world_points must be [B,S,H,W,3] "
+                f"and camera_poses [B,S,4,4], got {world_points.shape} / {camera_poses.shape}"
+            )
+        eye = torch.eye(4, device=camera_poses.device, dtype=camera_poses.dtype)
+        if not torch.allclose(camera_poses[:, 0], eye.expand(B, 4, 4), atol=1e-3, rtol=1e-3):
+            raise ValueError("GS camera poses must be first-frame-relative; pose[:,0] is not identity.")
 
         sh_dim = gs_params["sh_rest"].shape[-1]        # 3*sh_extra/3 = sh_extra
         # Recover sh_degree from rest dim (sh_extra = (deg+1)^2 - 1)

@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
+from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from panovggt.models.panovggt_model import PanoVGGTModel
@@ -34,12 +35,124 @@ _INPUT_H = 518
 _INPUT_W = 1036
 
 
+def ensure_batched_gs_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
+    param_name = name.rsplit(".", 1)[-1]
+    if param_name == "sh_rest":
+        if x.dim() == 5:
+            return x.unsqueeze(0)
+        if x.dim() == 6:
+            return x
+    else:
+        if x.dim() == 4:
+            return x.unsqueeze(0)
+        if x.dim() == 5:
+            return x
+    raise ValueError(f"unexpected GS tensor shape for {name}: {tuple(x.shape)}")
+
+
+def ensure_batched_map_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
+    if x is None:
+        raise ValueError(f"missing required tensor for {name}")
+    if x.dim() == 4:
+        return x.unsqueeze(0)
+    if x.dim() == 5:
+        return x
+    raise ValueError(f"unexpected tensor shape for {name}: {tuple(x.shape)}")
+
+
+def ensure_batched_pose_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
+    if x is None:
+        raise ValueError(f"missing required tensor for {name}")
+    if x.dim() == 3:
+        return x.unsqueeze(0)
+    if x.dim() == 4:
+        return x
+    raise ValueError(f"unexpected pose tensor shape for {name}: {tuple(x.shape)}")
+
+
+def normalize_gs_export_frame(
+    world_points: torch.Tensor,
+    local_points: torch.Tensor,
+    camera_poses: torch.Tensor,
+    depth: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Match the normalized cam0 frame used by the GS render loss."""
+    B, S, H, W, _ = world_points.shape
+    if local_points.shape != world_points.shape:
+        raise ValueError(
+            "GS export expects local_points/world_points with the same shape, "
+            f"got {tuple(local_points.shape)} / {tuple(world_points.shape)}"
+        )
+    if camera_poses.shape != (B, S, 4, 4):
+        raise ValueError(
+            f"GS export expects camera_poses shape {(B, S, 4, 4)}, "
+            f"got {tuple(camera_poses.shape)}"
+        )
+
+    valid = torch.isfinite(local_points).all(dim=-1)
+    distances = local_points.norm(dim=-1).masked_fill(~valid, 0.0)
+    denom = valid.float().sum(dim=(1, 2, 3)).clamp(min=1e-8)
+    norm_factor = distances.sum(dim=(1, 2, 3)) / denom
+    scale = norm_factor.view(B, 1, 1, 1, 1)
+
+    R0 = camera_poses[:, 0, :3, :3]
+    t0 = camera_poses[:, 0, :3, 3]
+    t_w2c = -torch.matmul(t0.unsqueeze(-2), R0).squeeze(-2)
+    world_points_cam0 = (
+        torch.matmul(world_points, R0.unsqueeze(1).unsqueeze(2))
+        + t_w2c.view(B, 1, 1, 1, 3)
+    ) / scale
+
+    if depth is None:
+        return world_points_cam0, None, norm_factor
+    if depth.dim() == 5:
+        depth = depth / scale
+    elif depth.dim() == 4:
+        depth = depth / norm_factor.view(B, 1, 1, 1)
+    else:
+        raise ValueError(f"unexpected tensor shape for depth: {tuple(depth.shape)}")
+    return world_points_cam0, depth, norm_factor
+
+
+def load_gs_conf(config_path: str) -> dict:
+    cfg = load_config(config_path)
+    gs_node = cfg.get("loss", {}).get("gs", {})
+    if OmegaConf.is_config(gs_node):
+        return OmegaConf.to_container(gs_node, resolve=True)
+    if gs_node is None:
+        return {}
+    if isinstance(gs_node, dict):
+        return dict(gs_node)
+    raise ValueError(f"unexpected loss.gs config type: {type(gs_node)!r}")
+
+
 # =========================================================================
 #  1.  Model Loading
 # =========================================================================
 
+def load_config(config_path: str):
+    path = Path(config_path)
+    if path.is_file():
+        path = path.resolve()
+        repo_config_dir = (Path(__file__).resolve().parent / "training" / "config").resolve()
+        try:
+            config_name = path.relative_to(repo_config_dir).with_suffix("").as_posix()
+        except ValueError:
+            cfg = OmegaConf.load(path)
+            OmegaConf.resolve(cfg)
+            return cfg
+        with initialize_config_dir(version_base=None, config_dir=str(repo_config_dir)):
+            return compose(config_name=config_name)
+
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str((Path(__file__).resolve().parent / "training" / "config").resolve()),
+    ):
+        return compose(config_name=config_path[:-5] if config_path.endswith(".yaml") else config_path)
+
+
 def load_model(config_path: str, checkpoint_path: str, device: str, enable_gaussian: bool = False) -> PanoVGGTModel:
-    cfg = OmegaConf.load(config_path)
+    cfg = load_config(config_path)
     OmegaConf.resolve(cfg)
     mc = cfg.model
     model_kwargs = dict(
@@ -307,10 +420,17 @@ def run_inference(
                 v_cpu = v_cpu.squeeze(0)
             out[k] = v_cpu.numpy()
         elif isinstance(v, dict):
-            out[k] = {
-                kk: (vv.float().cpu() if isinstance(vv, torch.Tensor) else vv)
-                for kk, vv in v.items()
-            }
+            out_dict = {}
+            for kk, vv in v.items():
+                if isinstance(vv, torch.Tensor):
+                    vv_f = vv.float() if vv.dtype == torch.bfloat16 else vv
+                    vv_cpu = vv_f.cpu()
+                    if vv_cpu.dim() >= 1 and vv_cpu.shape[0] == 1:
+                        vv_cpu = vv_cpu.squeeze(0)
+                    out_dict[kk] = vv_cpu
+                else:
+                    out_dict[kk] = vv
+            out[k] = out_dict
         else:
             out[k] = v
 
@@ -503,25 +623,48 @@ def main(args: argparse.Namespace) -> None:
     if enable_gaussian and "gaussian" in preds and preds["gaussian"] is not None:
         gs_path = args.gs_ply or os.path.join(out_root, "gaussians.ply")
         gs_dict = preds["gaussian"]
-        # bring world_points back as a torch tensor with batch dim for aggregator
         wp = preds.get("world_points")
-        if isinstance(wp, np.ndarray):
-            wp_t = torch.from_numpy(wp).unsqueeze(0)
-        else:
-            wp_t = wp.unsqueeze(0) if wp.dim() == 4 else wp
+        local_points_for_gs = preds.get("local_points")
+        camera_poses_for_gs = preds.get("camera_poses")
+        images_for_gs = preds.get("images")
+        depth_for_gs = preds.get("depth")
+        wp_t = torch.from_numpy(wp) if isinstance(wp, np.ndarray) else wp
+        local_t = torch.from_numpy(local_points_for_gs) if isinstance(local_points_for_gs, np.ndarray) else local_points_for_gs
+        poses_t = torch.from_numpy(camera_poses_for_gs) if isinstance(camera_poses_for_gs, np.ndarray) else camera_poses_for_gs
+        images_t = torch.from_numpy(images_for_gs) if isinstance(images_for_gs, np.ndarray) else images_for_gs
+        depth_t = torch.from_numpy(depth_for_gs) if isinstance(depth_for_gs, np.ndarray) else depth_for_gs
+        wp_t = ensure_batched_map_tensor(wp_t, "world_points")
+        local_t = ensure_batched_map_tensor(local_t, "local_points")
+        poses_t = ensure_batched_pose_tensor(poses_t, "camera_poses")
+        images_t = ensure_batched_map_tensor(images_t, "images")
+        if depth_t is not None:
+            depth_t = ensure_batched_map_tensor(depth_t, "depth")
+        wp_t, depth_t, norm_factor = normalize_gs_export_frame(
+            world_points=wp_t,
+            local_points=local_t,
+            camera_poses=poses_t,
+            depth=depth_t,
+        )
         gs_tensors = {}
         for k, v in gs_dict.items():
             if isinstance(v, torch.Tensor):
-                gs_tensors[k] = v.unsqueeze(0) if v.dim() == 4 else v
+                vv = v
             else:
                 vv = torch.from_numpy(v)
-                gs_tensors[k] = vv.unsqueeze(0) if vv.dim() == 4 else vv
+            gs_tensors[k] = ensure_batched_gs_tensor(vv, f"gaussian.{k}")
         wrap = {
             "gaussian": gs_tensors,
             "world_points": wp_t,
+            "images": images_t,
+            "depth": depth_t,
         }
         from panovggt.utils.gs_export import aggregate_predictions, gs_to_ply
-        agg = aggregate_predictions(wrap, sh_degree=int(getattr(model, "gs_sh_degree", 1)))
+        gs_conf = load_gs_conf(args.config)
+        agg = aggregate_predictions(
+            wrap,
+            sh_degree=int(getattr(model, "gs_sh_degree", 1)),
+            gs_conf=gs_conf,
+        )
         gs_to_ply(
             means=agg["means"],
             scales=agg["scales"],
@@ -532,6 +675,7 @@ def main(args: argparse.Namespace) -> None:
             out_path=gs_path,
         )
         print(f"[gs] aggregated {agg['means'].shape[0]:,} Gaussians → {gs_path}")
+        print(f"[gs] export frame: normalized cam0, norm_factor={norm_factor.tolist()}")
 
     print(f"\n✅ Done.  Results written to: {out_root}")
 

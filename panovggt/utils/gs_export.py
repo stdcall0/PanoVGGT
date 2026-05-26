@@ -66,25 +66,38 @@ def gs_to_ply(
 def aggregate_predictions(
     pred: Dict[str, torch.Tensor],
     sh_degree: int = 1,
+    gs_conf: Optional[Dict] = None,
 ) -> Dict[str, torch.Tensor]:
     """Flatten the GS branch's (B,S,Hp,Wp,*) tensors into a single set in world frame.
 
     Centers come from `world_points` patch-pooled to (B,S,Hp,Wp,3) — done by
     averaging 14x14 windows.
     """
-    from panovggt.render.gs_utils import patch_pool
+    from panovggt.render.gs_branch import materialize_gaussians
 
     g = pred["gaussian"]
-    B, S, Hp, Wp, _ = g["sh_dc"].shape
-    H, W = pred["world_points"].shape[2:4]
-    patch = H // Hp
-    centers_pp = patch_pool(pred["world_points"], patch).reshape(-1, 3)
-    means = centers_pp + g["offset"].reshape(-1, 3)
-    scales = g["scale"].reshape(-1, 3)
-    quats = g["rotation"].reshape(-1, 4)
-    opacities = g["opacity"].reshape(-1)
-    sh_dc = g["sh_dc"].reshape(-1, 3)
-    sh_rest = g["sh_rest"]
+    if g["sh_dc"].dim() != 5:
+        raise ValueError(f"expected gaussian tensors with shape [B,S,Hp,Wp,C], got {g['sh_dc'].shape}")
+    if "world_points" not in pred or "images" not in pred:
+        raise KeyError("GS export requires `world_points` and `images` to materialize training-time Gaussians.")
+
+    gs_conf = gs_conf or {}
+    depth = pred.get("depth", None)
+    materialized = materialize_gaussians(
+        gs_params=g,
+        world_points=pred["world_points"],
+        images=pred["images"],
+        depth=depth,
+        gs_conf=gs_conf,
+        sh_degree=sh_degree,
+    )
+
+    means = materialized["centers"].reshape(-1, 3)
+    scales = materialized["scales"].reshape(-1, 3)
+    quats = materialized["rotations"].reshape(-1, 4)
+    opacities = materialized["opacities"].reshape(-1)
+    sh_dc = materialized["sh_dc"].reshape(-1, 3)
+    sh_rest = materialized["sh_rest"]
     if sh_rest.shape[-1] > 0:
         sh_rest = sh_rest.reshape(-1, 3, sh_rest.shape[-1])
     else:

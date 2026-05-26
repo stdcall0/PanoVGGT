@@ -17,11 +17,9 @@ This module:
 from typing import Dict, Optional
 
 import torch
-import torch.nn.functional as F
 
 from panovggt.utils.geometry import se3_inverse
-from .cube_renderer import CubePanoRenderer
-from .gs_utils import patch_pool, depth_footprint_scale, knn_scale, softplus_inv
+from .gs_utils import patch_pool, depth_footprint_scale, knn_scale
 
 
 class GSBranch:
@@ -66,6 +64,7 @@ class GSBranch:
         )
 
         if renderer == "cube":
+            from .cube_renderer import CubePanoRenderer
             self.renderer = CubePanoRenderer(
                 equ_h=equ_h,
                 face_res=face_res,
@@ -88,14 +87,13 @@ class GSBranch:
         return init.detach()
 
     # ---------------------------------------------------------------------
-    def render(
+    def materialize(
         self,
         gs_params: Dict[str, torch.Tensor],   # output of LinearGaussianHead
         world_points: torch.Tensor,           # (B,S,H,W,3) — predicted
-        camera_poses_c2w: torch.Tensor,       # (B,S,4,4)
         images: torch.Tensor,                 # (B,S,3,H,W) GT
         depth: Optional[torch.Tensor] = None, # (B,S,H,W,1) predicted
-    ):
+    ) -> Dict[str, torch.Tensor]:
         B, S, H, W, _ = world_points.shape
         patch_size = H // gs_params["sh_dc"].shape[2]
         Hp = gs_params["sh_dc"].shape[2]
@@ -169,12 +167,45 @@ class GSBranch:
         sh_rest_kx = sh_rest.permute(0, 1, 2, 3, 5, 4).contiguous()  # (...,K-1,3)
         colors_sh = torch.cat([sh_dc_kx, sh_rest_kx], dim=-2)      # (...,K,3)
 
+        return dict(
+            centers=centers,
+            scales=scale_final,
+            rotations=rotation_final,
+            opacities=opacity_final,
+            sh_dc=sh_dc,
+            sh_rest=sh_rest,
+            colors_sh=colors_sh,
+            patch_size=torch.as_tensor(patch_size, device=world_points.device),
+        )
+
+    # ---------------------------------------------------------------------
+    def render(
+        self,
+        gs_params: Dict[str, torch.Tensor],   # output of LinearGaussianHead
+        world_points: torch.Tensor,           # (B,S,H,W,3) — predicted
+        camera_poses_c2w: torch.Tensor,       # (B,S,4,4)
+        images: torch.Tensor,                 # (B,S,3,H,W) GT
+        depth: Optional[torch.Tensor] = None, # (B,S,H,W,1) predicted
+    ):
+        B = world_points.shape[0]
+        materialized = self.materialize(
+            gs_params=gs_params,
+            world_points=world_points,
+            images=images,
+            depth=depth,
+        )
+        centers = materialized["centers"]
+        scale_final = materialized["scales"]
+        rotation_final = materialized["rotations"]
+        opacity_final = materialized["opacities"]
+        colors_sh = materialized["colors_sh"]
+
         # ---- flatten to (N, *) for gsplat ---------------------------------
         means = centers.view(-1, 3)
         scales = scale_final.view(-1, 3)
         quats = rotation_final.view(-1, 4)
         opacities = opacity_final.view(-1)
-        colors = colors_sh.view(-1, K, 3)
+        colors = colors_sh.view(-1, colors_sh.shape[-2], 3)
 
         # ---- viewmats: w2c per input view --------------------------------
         c2w = camera_poses_c2w
@@ -209,3 +240,32 @@ class GSBranch:
             opacities=opacity_final,
             colors_sh=colors_sh,
         )
+
+
+def materialize_gaussians(
+    gs_params: Dict[str, torch.Tensor],
+    world_points: torch.Tensor,
+    images: torch.Tensor,
+    depth: Optional[torch.Tensor],
+    gs_conf: Dict,
+    sh_degree: int,
+) -> Dict[str, torch.Tensor]:
+    """Build the exact Gaussian tensors used by GSBranch.render for export/tests."""
+    branch = object.__new__(GSBranch)
+    branch.renderer_name = str(gs_conf.get("renderer", "cube"))
+    branch.sh_degree = int(sh_degree)
+    branch.scale_init_mode = str(gs_conf.get("scale_init_mode", "depth_footprint"))
+    branch.scale_init_value = float(gs_conf.get("scale_init_value", 0.01))
+    branch.use_offset = bool(gs_conf.get("use_offset", False))
+    branch.detach_centers = bool(gs_conf.get("detach_centers", True))
+    branch.detach_camera = bool(gs_conf.get("detach_camera", True))
+    branch.gs_head = None
+    branch.train_flags = dict(
+        sh_dc=bool(gs_conf.get("train_dc", True)),
+        opacity=bool(gs_conf.get("train_opacity", True)),
+        scale=bool(gs_conf.get("train_scale", False)),
+        rotation=bool(gs_conf.get("train_rotation", False)),
+        sh_rest=bool(gs_conf.get("train_sh_rest", False)),
+        offset=bool(gs_conf.get("use_offset", False)),
+    )
+    return branch.materialize(gs_params, world_points, images, depth)
