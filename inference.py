@@ -509,8 +509,15 @@ def main(args: argparse.Namespace) -> None:
             wp_t = torch.from_numpy(wp).unsqueeze(0)
         else:
             wp_t = wp.unsqueeze(0) if wp.dim() == 4 else wp
+        gs_tensors = {}
+        for k, v in gs_dict.items():
+            if isinstance(v, torch.Tensor):
+                gs_tensors[k] = v.unsqueeze(0) if v.dim() == 4 else v
+            else:
+                vv = torch.from_numpy(v)
+                gs_tensors[k] = vv.unsqueeze(0) if vv.dim() == 4 else vv
         wrap = {
-            "gaussian": {k: v.unsqueeze(0) for k, v in gs_dict.items()},
+            "gaussian": gs_tensors,
             "world_points": wp_t,
         }
         from panovggt.utils.gs_export import aggregate_predictions, gs_to_ply
