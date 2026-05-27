@@ -126,6 +126,21 @@ class CubePanoRenderer(nn.Module):
             m[..., :, -bp:] = 0.0
         return m
 
+    def _face_ray_norm(self, device, dtype) -> torch.Tensor:
+        """Per-face factor converting perspective z-depth to radial depth."""
+        f = 0.5 * self.face_res / math.tan(0.5 * self.fov_rad)
+        c = (self.face_res - 1) / 2.0
+        ys, xs = torch.meshgrid(
+            torch.arange(self.face_res, device=device, dtype=dtype),
+            torch.arange(self.face_res, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        x = (xs - c) / f
+        y = (ys - c) / f
+        return torch.sqrt(x.square() + y.square() + 1.0).view(
+            1, self.face_res, self.face_res, 1
+        )
+
     def render(
         self,
         means: torch.Tensor,
@@ -189,6 +204,7 @@ class CubePanoRenderer(nn.Module):
         rgb_d = rgb
         rgb_only = rgb_d[..., :3]              # (6V, H, W, 3)
         depth = rgb_d[..., 3:4]                # (6V, H, W, 1)
+        depth = depth * self._face_ray_norm(device=device, dtype=dtype)
         alpha = alpha                          # (6V, H, W, 1)
 
         # reshape to (V, C, 6, face, face) for cube2equi

@@ -70,6 +70,20 @@ def ensure_batched_pose_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
     raise ValueError(f"unexpected pose tensor shape for {name}: {tuple(x.shape)}")
 
 
+def invert_homogeneous_matrix(T: torch.Tensor) -> torch.Tensor:
+    """Invert batched 4x4 homogeneous transforms without assuming SO(3)."""
+    return torch.linalg.inv(T.float()).to(dtype=T.dtype)
+
+
+def transform_points_homogeneous(points: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+    """Apply batched column-convention 4x4 transforms to [B,S,H,W,3] points."""
+    points_h = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1).float()
+    out_h = torch.einsum("bij,bshwj->bshwi", T.float(), points_h)
+    w = out_h[..., 3:4]
+    safe_w = torch.where(w.abs() > 1e-8, w, torch.ones_like(w))
+    return (out_h[..., :3] / safe_w).to(dtype=points.dtype)
+
+
 def normalize_gs_export_frame(
     world_points: torch.Tensor,
     local_points: torch.Tensor,
@@ -95,13 +109,8 @@ def normalize_gs_export_frame(
     norm_factor = distances.sum(dim=(1, 2, 3)) / denom
     scale = norm_factor.view(B, 1, 1, 1, 1)
 
-    R0 = camera_poses[:, 0, :3, :3]
-    t0 = camera_poses[:, 0, :3, 3]
-    t_w2c = -torch.matmul(t0.unsqueeze(-2), R0).squeeze(-2)
-    world_points_cam0 = (
-        torch.matmul(world_points, R0.unsqueeze(1).unsqueeze(2))
-        + t_w2c.view(B, 1, 1, 1, 3)
-    ) / scale
+    cam0_w2c = invert_homogeneous_matrix(camera_poses[:, :1])[:, 0]
+    world_points_cam0 = transform_points_homogeneous(world_points, cam0_w2c) / scale
 
     if depth is None:
         return world_points_cam0, None, norm_factor

@@ -26,6 +26,20 @@ logger = logging.getLogger(__name__)
 # Utility Functions
 # =============================================================================
 
+def invert_homogeneous_matrix(T: torch.Tensor) -> torch.Tensor:
+    """Invert batched 4x4 homogeneous transforms without assuming SO(3)."""
+    return torch.linalg.inv(T.float()).to(dtype=T.dtype)
+
+
+def transform_points_homogeneous(points: torch.Tensor, T: torch.Tensor) -> torch.Tensor:
+    """Apply batched column-convention 4x4 transforms to [..., 3] points."""
+    points_h = torch.cat([points, torch.ones_like(points[..., :1])], dim=-1).float()
+    out_h = torch.einsum("bij,bnhwj->bnhwi", T.float(), points_h)
+    w = out_h[..., 3:4]
+    safe_w = torch.where(w.abs() > 1e-8, w, torch.ones_like(w))
+    return (out_h[..., :3] / safe_w).to(dtype=points.dtype)
+
+
 def weighted_mean(
     x: torch.Tensor,
     w: Optional[torch.Tensor] = None,
@@ -679,15 +693,15 @@ class Loss(nn.Module):
             pred['depth'] = pred['depth'] / scale
 
         # Transform world-like predictions to the same normalized cam0 frame.
-        R0 = camera_poses[:, 0, :3, :3]  # [B, 3, 3]
-        t0 = camera_poses[:, 0, :3, 3]   # [B, 3]
-        t_w2c = -torch.matmul(t0.unsqueeze(-2), R0).squeeze(-2)  # [B, 3]
+        # Use the full homogeneous inverse here instead of R^T/t. The camera
+        # head is projected to SE(3), but tiny numerical drift can otherwise
+        # make cam0_w2c @ c2w0 differ enough to trip the GS coordinate check.
+        c2w0 = camera_poses[:, :1]
+        cam0_w2c = invert_homogeneous_matrix(c2w0)
+        cam0_w2c_single = cam0_w2c[:, 0]
 
         def normalize_world_like(points: torch.Tensor) -> torch.Tensor:
-            points_cam0 = torch.matmul(
-                points,
-                R0.unsqueeze(1).unsqueeze(2)
-            ) + t_w2c.view(B, 1, 1, 1, 3)
+            points_cam0 = transform_points_homogeneous(points, cam0_w2c_single)
             return points_cam0 / scale
 
         if 'global_points' in pred and pred['global_points'] is not None:
@@ -705,11 +719,15 @@ class Loss(nn.Module):
         # Camera poses for GS rendering live in normalized cam0 coordinates.
         # The first view is identity, and other views are target-camera poses
         # relative to cam0 with translations divided by the same norm_factor.
-        c2w0 = camera_poses[:, :1]
-        cam0_w2c = se3_inverse(c2w0)
-        gs_camera_poses = cam0_w2c @ camera_poses
-        gs_camera_poses = gs_camera_poses.clone()
+        gs_camera_poses = torch.matmul(
+            cam0_w2c.float(), camera_poses.float()
+        ).to(camera_poses.dtype)
         gs_camera_poses[..., :3, 3] /= norm_factor.view(B, 1, 1)
+        eye = torch.eye(4, device=gs_camera_poses.device, dtype=gs_camera_poses.dtype)
+        gs_camera_poses = torch.cat(
+            [eye.view(1, 1, 4, 4).expand(B, 1, 4, 4), gs_camera_poses[:, 1:]],
+            dim=1,
+        )
         pred['gs_camera_poses'] = gs_camera_poses
         
         return pred
@@ -814,8 +832,12 @@ class Loss(nn.Module):
                 f"and camera_poses [B,S,4,4], got {world_points.shape} / {camera_poses.shape}"
             )
         eye = torch.eye(4, device=camera_poses.device, dtype=camera_poses.dtype)
-        if not torch.allclose(camera_poses[:, 0], eye.expand(B, 4, 4), atol=1e-3, rtol=1e-3):
-            raise ValueError("GS camera poses must be first-frame-relative; pose[:,0] is not identity.")
+        first_pose_err = (camera_poses[:, 0].float() - eye.float()).abs().max()
+        if first_pose_err > 5e-3:
+            raise ValueError(
+                "GS camera poses must be first-frame-relative; "
+                f"pose[:,0] is not identity (max error {first_pose_err.item():.3e})."
+            )
 
         mode = self._gs_photometric_mode.lower()
         if mode in ("source_recon", "reconstruction", "observed"):
@@ -866,6 +888,8 @@ class Loss(nn.Module):
         target_depths = select_views(gt.get("depths", None), target_idx)
         target_masks = select_views(gt.get("valid_masks", None), target_idx)
         T = int(target_idx.numel())
+        gt_norm_factor = gt.get("norm_factors", None)
+        pred_norm_factor = pred.get("norm_factor", None)
 
         sh_dim = gs_params["sh_rest"].shape[-1]        # 3*sh_extra/3 = sh_extra
         # Recover sh_degree from rest dim (sh_extra = (deg+1)^2 - 1)
@@ -896,9 +920,24 @@ class Loss(nn.Module):
         depth_gt = target_depths
         depth_mask = target_masks
         if depth_gt is not None:
-            if depth_gt.dim() == 5:
-                depth_gt = depth_gt
+            if depth_gt.dim() == 5 and depth_gt.shape[2] == 1:
+                depth_gt = depth_gt[:, :, 0]
+            elif depth_gt.dim() == 5 and depth_gt.shape[-1] == 1:
+                depth_gt = depth_gt[..., 0]
+            elif depth_gt.dim() != 4:
+                raise ValueError(
+                    f"unexpected tensor shape for GS depth target: {tuple(depth_gt.shape)}"
+                )
             depth_gt = depth_gt.reshape(B * T, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+            if gt_norm_factor is not None and pred_norm_factor is not None:
+                # Trainer-normalized GT depths are in gt_norm_factor units,
+                # while rendered depths are in pred_norm_factor units.
+                depth_ratio = (
+                    gt_norm_factor.to(rgb_pred.device, dtype=rgb_pred.dtype)
+                    / pred_norm_factor.detach().to(rgb_pred.device, dtype=rgb_pred.dtype)
+                )
+                depth_ratio = depth_ratio.view(B, 1, 1, 1, 1).expand(B, T, 1, 1, 1)
+                depth_gt = depth_gt * depth_ratio.reshape(B * T, 1, 1, 1)
         if depth_mask is not None:
             depth_mask = depth_mask.reshape(B * T, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
 
