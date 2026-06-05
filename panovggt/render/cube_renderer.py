@@ -11,12 +11,43 @@ Camera poses are stop-gradient'ed by default (controlled at the caller).
 """
 
 import math
+import os
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
 
 from .cube_to_equi import Cube2Equirec, opencv_face_rotations
+
+
+_GSPLAT_BACKEND_READY = False
+
+
+def _ensure_gsplat_backend_loaded_once() -> None:
+    """Serialize gsplat lazy CUDA extension JIT across DDP ranks."""
+    global _GSPLAT_BACKEND_READY
+    if _GSPLAT_BACKEND_READY:
+        return
+
+    lock_root = os.environ.get("TORCH_EXTENSIONS_DIR") or "/tmp"
+    os.makedirs(lock_root, exist_ok=True)
+    lock_path = os.path.join(lock_root, "gsplat_cuda_jit.lock")
+
+    try:
+        import fcntl
+
+        with open(lock_path, "w") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            from gsplat.cuda import _backend  # noqa: F401
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except ImportError:
+        raise
+    except Exception:
+        # Non-POSIX fallback or lock-file edge case; let gsplat surface the
+        # real import/JIT error if this still fails.
+        from gsplat.cuda import _backend  # noqa: F401
+
+    _GSPLAT_BACKEND_READY = True
 
 
 def _make_intrinsic(face_res: int, fov_rad: float, device, dtype) -> torch.Tensor:
@@ -73,6 +104,7 @@ class CubePanoRenderer(nn.Module):
     def _load_rasterization(self):
         if self._rasterization is None:
             try:
+                _ensure_gsplat_backend_loaded_once()
                 from gsplat import rasterization
             except Exception as exc:
                 raise ImportError(
@@ -181,7 +213,7 @@ class CubePanoRenderer(nn.Module):
             None
             if self.bg_color is None
             else torch.full(
-                (6 * V, 4), float(self.bg_color), device=device, dtype=dtype
+                (6 * V, 3), float(self.bg_color), device=device, dtype=dtype
             )
         )
 
@@ -197,10 +229,10 @@ class CubePanoRenderer(nn.Module):
             width=self.face_res,
             height=self.face_res,
             sh_degree=self.sh_degree,
-            render_mode="RGB+D",
+            render_mode="RGB+ED",
             packed=True,
         )
-        # rgb is (6V, H, W, 4)  (RGB+D)
+        # rgb is (6V, H, W, 4)  (RGB + expected depth)
         rgb_d = rgb
         rgb_only = rgb_d[..., :3]              # (6V, H, W, 3)
         depth = rgb_d[..., 3:4]                # (6V, H, W, 1)

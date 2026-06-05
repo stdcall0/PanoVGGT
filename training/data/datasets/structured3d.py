@@ -379,14 +379,14 @@ class Structured3DDataset(BaseDataset):
             max_frames = min(24, len(room_data))
             img_per_seq = random.randint(2, max_frames)
         if ids is None:
-            ids = np.random.choice(len(room_data), img_per_seq, replace=self.allow_duplicate_img)
+            ids = np.random.choice(len(room_data), img_per_seq, replace=(self.allow_duplicate_img or len(room_data) < img_per_seq))
 
         if self.get_nearby:
             ids = self.get_nearby_ids(ids, len(room_data), expand_ratio=self.expand_ratio)
             ids = [int(i) for i in ids if int(i) < len(room_data)]
             if len(ids) < 2:
                 ids = np.random.choice(len(room_data), max(2, img_per_seq),
-                                       replace=self.allow_duplicate_img).tolist()
+                                       replace=(self.allow_duplicate_img or len(room_data) < img_per_seq)).tolist()
 
         # Use fixed training resolution.
         base_h, base_w = self.base_resolution
@@ -431,6 +431,10 @@ class Structured3DDataset(BaseDataset):
                     depth_max=self.depth_max
                 )
 
+                if int(frame_data['valid_mask'].sum().item()) < 1024:
+                    logging.warning("Skipping frame with too few valid depth pixels")
+                    continue
+
                 batch_data['images'].append(frame_data['rgb'])
                 batch_data['depths'].append(frame_data['depth_tensor'])
                 batch_data['extrinsics'].append(frame_data['extrinsic'])
@@ -445,8 +449,8 @@ class Structured3DDataset(BaseDataset):
                 logging.warning(f"Error processing room {room_id}: {e}")
                 continue
 
-        if len(batch_data['images']) < 2:
-            logging.error(f"Not enough valid frames after processing. Retrying...")
+        if len(batch_data['images']) < img_per_seq:
+            logging.error(f"Not enough valid frames after processing for requested image count. Retrying...")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         return {
@@ -520,7 +524,7 @@ class Structured3DDataset(BaseDataset):
             return (img_rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)  # CHW
         except Exception as e:
             logging.error(f"Error reading image {path}: {e}")
-            return np.zeros((3, h, w), dtype=np.float32)
+            raise
         
     def _to_single_channel(self, d: np.ndarray) -> np.ndarray:
         """Ensure depth input is a single-channel 2D array of shape (H, W)."""
@@ -553,4 +557,4 @@ class Structured3DDataset(BaseDataset):
             return img[None, ...]
         except Exception as e:
             logging.error(f"Error reading depth {path}: {e}")
-            return np.zeros((1, h, w), dtype=np.float32)
+            raise

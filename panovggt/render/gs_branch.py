@@ -19,7 +19,7 @@ from typing import Dict, Optional
 import torch
 
 from panovggt.utils.geometry import se3_inverse
-from .gs_utils import patch_pool, depth_footprint_scale, knn_scale
+from .gs_utils import patch_pool, patch_valid_ratio, depth_footprint_scale, knn_scale
 
 
 class GSBranch:
@@ -43,6 +43,7 @@ class GSBranch:
         train_scale: bool = False,
         train_rotation: bool = False,
         train_sh_rest: bool = False,
+        min_valid_ratio: float = 0.25,
         gs_head=None,                                # used to gate trainables
     ):
         self.renderer_name = renderer
@@ -52,6 +53,7 @@ class GSBranch:
         self.use_offset = use_offset
         self.detach_centers = detach_centers
         self.detach_camera = detach_camera
+        self.min_valid_ratio = float(min_valid_ratio)
         self.gs_head = gs_head
 
         self.train_flags = dict(
@@ -93,6 +95,7 @@ class GSBranch:
         world_points: torch.Tensor,           # (B,S,H,W,3) — predicted
         images: torch.Tensor,                 # (B,S,3,H,W) GT
         depth: Optional[torch.Tensor] = None, # (B,S,H,W,1) predicted
+        point_masks: Optional[torch.Tensor] = None, # (B,S,H,W) valid geometry mask
     ) -> Dict[str, torch.Tensor]:
         B, S, H, W, _ = world_points.shape
         patch_size = H // gs_params["sh_dc"].shape[2]
@@ -101,6 +104,10 @@ class GSBranch:
         assert patch_size * Hp == H and patch_size * Wp == W, (patch_size, Hp, Wp, H, W)
 
         # ---- centers ------------------------------------------------------
+        patch_valid = None
+        if point_masks is not None:
+            patch_valid = patch_valid_ratio(point_masks, patch_size).unsqueeze(-1)
+
         centers_pp = patch_pool(world_points, patch_size)  # (B,S,Hp,Wp,3)
         if self.detach_centers:
             centers_pp = centers_pp.detach()
@@ -127,15 +134,19 @@ class GSBranch:
         # ---- scale init ---------------------------------------------------
         if self.scale_init_mode == "depth_footprint" and depth is not None:
             d = depth if depth.dim() == 4 else depth.squeeze(-1)
-            scale_init = depth_footprint_scale(d, patch_size, H)        # (B,S,Hp,Wp,3)
+            scale_init = depth_footprint_scale(
+                d, patch_size, H, valid_mask=point_masks
+            )        # (B,S,Hp,Wp,3)
         elif self.scale_init_mode == "knn":
             scale_init = knn_scale(centers_pp.detach(), k=3)
         else:
             scale_init = torch.full_like(gs_params["scale"], float(self.scale_init_value))
-        # For training scale we pass the raw network output (already softplus'd).
-        # For "frozen" scale stages, replace by scale_init.
+        # Keep the configured scale init as the geometric prior. The head's
+        # softplus output is initialized to scale_init_value, so this starts at
+        # scale_init and learns a positive multiplicative correction.
         if self.train_flags["scale"]:
-            scale_final = gs_params["scale"]
+            scale_mult = gs_params["scale"] / max(float(self.scale_init_value), 1e-6)
+            scale_final = scale_init.detach() * scale_mult
         else:
             scale_final = scale_init.detach()
 
@@ -150,6 +161,9 @@ class GSBranch:
         opacity_final = gs_params["opacity"]
         if not self.train_flags["opacity"]:
             opacity_final = opacity_final.detach()
+        if patch_valid is not None:
+            gaussian_valid = (patch_valid >= self.min_valid_ratio).to(opacity_final.dtype)
+            opacity_final = opacity_final * gaussian_valid
 
         # ---- pack SH ------------------------------------------------------
         # gsplat wants colors of shape (N, K, 3) where K = (sh_degree+1)**2.
@@ -172,6 +186,7 @@ class GSBranch:
             scales=scale_final,
             rotations=rotation_final,
             opacities=opacity_final,
+            patch_valid=patch_valid,
             sh_dc=sh_dc,
             sh_rest=sh_rest,
             colors_sh=colors_sh,
@@ -186,6 +201,7 @@ class GSBranch:
         camera_poses_c2w: torch.Tensor,       # (B,S,4,4)
         images: torch.Tensor,                 # (B,S,3,H,W) GT
         depth: Optional[torch.Tensor] = None, # (B,S,H,W,1) predicted
+        point_masks: Optional[torch.Tensor] = None, # (B,S,H,W) valid geometry mask
     ):
         B = world_points.shape[0]
         materialized = self.materialize(
@@ -193,6 +209,7 @@ class GSBranch:
             world_points=world_points,
             images=images,
             depth=depth,
+            point_masks=point_masks,
         )
         centers = materialized["centers"]
         scale_final = materialized["scales"]
@@ -239,6 +256,7 @@ class GSBranch:
             rotations=rotation_final,
             opacities=opacity_final,
             colors_sh=colors_sh,
+            patch_valid=materialized.get("patch_valid"),
         )
 
 
@@ -268,4 +286,5 @@ def materialize_gaussians(
         sh_rest=bool(gs_conf.get("train_sh_rest", False)),
         offset=bool(gs_conf.get("use_offset", False)),
     )
+    branch.min_valid_ratio = float(gs_conf.get("min_valid_ratio", 0.25))
     return branch.materialize(gs_params, world_points, images, depth)

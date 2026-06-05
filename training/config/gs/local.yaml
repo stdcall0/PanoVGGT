@@ -1,11 +1,19 @@
 # @package _global_
-# Local full-GS training with the original source-view reconstruction render loss.
+# Local GS-head bootstrap config.
+# Four datasets: Stanford2D3DS + Structured3D + PanoCity + Matterport3D.
+# Initial phase: source-view self reconstruction, no novel-view rendering.
 
 defaults:
   - /default
   - _self_
 
 exp_name: gs_local
+
+max_epochs: 80
+accum_steps: 1
+max_img_per_gpu: 16
+max_img_per_gpu_val: 8
+limit_val_batches: 50
 
 model:
   enable_global_points: True
@@ -20,56 +28,61 @@ loss:
   gs:
     enabled: True
     photometric_mode: source_recon
+    self_recon: True
+    mask_rgb_by_valid: True
     renderer: cube
-    face_res: 512
+    face_res: 256
     fov_deg: 95.0
     boundary_px: 4
     scale_init_mode: depth_footprint
     scale_init_value: 0.01
+    min_valid_ratio: 0.25
     use_offset: True
     detach_centers: True
     detach_camera: True
     train_dc: True
     train_opacity: True
     train_scale: True
-    train_rotation: True
-    train_sh_rest: True
+    train_rotation: False
+    train_sh_rest: False
     rgb_weight: 1.0
-    ssim_weight: 0.2
-    depth_weight: 0.05
+    ssim_weight: 0.1
+    depth_weight: 0.0
     loss_weight: 1.0
     point_loss_weight: 0.0
     camera_loss_weight: 0.0
 
 optim:
   frozen_module_names:
-    - "aggregator"
-    - "point_decoder"
-    - "point_head"
-    - "camera_decoder"
-    - "camera_head"
-    - "global_points_decoder"
-    - "global_point_head"
-    - "pos_adapters"
+    - aggregator
+    - point_decoder
+    - point_head
+    - camera_decoder
+    - camera_head
+    - global_points_decoder
+    - global_point_head
+    - pos_adapters
+    - gaussian_head.rotation
+    - gaussian_head.sh_rest
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 5e-6
+    lr: 2e-6
     weight_decay: 0.05
   gradient_clip:
     _target_: train_utils.gradient_clip.GradientClipper
     configs:
-      - module_name: ["gaussian"]
+      - module_name: [gaussian]
         max_norm: 1.0
         norm_type: 2
 
 checkpoint:
-  save_dir: ./outputs/gs_local/ckpts
+  save_dir: ./outputs/${exp_name}/ckpts
   save_freq: 5
   resume_checkpoint_path: null
   strict: False
 
 logging:
-  log_dir: ./outputs/gs_local
+  log_dir: ./outputs/${exp_name}
   log_exp: ${exp_name}
   log_visuals: False
   log_freq: 1
@@ -97,45 +110,54 @@ logging:
 
 data:
   train:
+    common_config:
+      img_nums: [2, 4]
+      allow_duplicate_img: False
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
           split: train
-          Stanford2D3DS_DIR: ./dataset/Stanford2D3DS
+          Stanford2D3DS_DIR: ../dataset/Stanford2D3DS
           len_train: 2400
           get_nearby: False
         - _target_: data.datasets.structured3d.Structured3DDataset
           split: train
-          Structured3D_DIR: ./dataset/Structured3D/Structured3D
+          Structured3D_DIR: ../dataset/Structured3D/Structured3D
           len_train: 2400
           get_nearby: False
         - _target_: data.datasets.panocity.PanoCityDataset
           split: train
-          PanoCity_DIR: ./dataset/PanoCity
+          PanoCity_DIR: ../dataset/PanoCity
           len_train: 16800
           get_nearby: True
         - _target_: data.datasets.matterport3d.Matterport3DDataset
           split: train
-          Matterport3D_DIR: ./dataset/Matterport3D/processed
+          Matterport3D_DIR: ../dataset/Matterport3D/processed
           len_train: 4800
+          get_nearby: False
   val:
+    common_config:
+      inside_random: False
+      fix_img_num: 4
+      fix_aspect_ratio: 1.0
+      img_nums: [4, 4]
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
         - _target_: data.datasets.stanford2d3ds.Stanford2D3DSDataset
           split: test
-          Stanford2D3DS_DIR: ./dataset/Stanford2D3DS
+          Stanford2D3DS_DIR: ../dataset/Stanford2D3DS
           len_test: 240
         - _target_: data.datasets.structured3d.Structured3DDataset
           split: test
-          Structured3D_DIR: ./dataset/Structured3D/Structured3D
+          Structured3D_DIR: ../dataset/Structured3D/Structured3D
           len_test: 1400
         - _target_: data.datasets.panocity.PanoCityDataset
           split: test
-          PanoCity_DIR: ./dataset/PanoCity
+          PanoCity_DIR: ../dataset/PanoCity
           len_test: 2400
         - _target_: data.datasets.matterport3d.Matterport3DDataset
           split: test
-          Matterport3D_DIR: ./dataset/Matterport3D/processed
+          Matterport3D_DIR: ../dataset/Matterport3D/processed
           len_test: 480

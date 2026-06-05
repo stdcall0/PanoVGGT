@@ -218,7 +218,7 @@ class Trainer:
             self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
         else:
             if "prev_epoch" in checkpoint:
-                self.epoch = checkpoint["prev_epoch"]
+                self.epoch = checkpoint["prev_epoch"] + 1
             elif "epoch" in checkpoint:
                 self.epoch = checkpoint["epoch"]
             else:
@@ -437,6 +437,7 @@ class Trainer:
         )
 
         self.model.eval()
+        self.loss.eval()
         end = time.time()
 
         iters_per_epoch = len(val_loader)
@@ -496,6 +497,7 @@ class Trainer:
         )
 
         self.model.train()
+        self.loss.train()
         end = time.time()
 
         iters_per_epoch = len(train_loader)
@@ -540,7 +542,18 @@ class Trainer:
             accum_steps = self.accum_steps
             chunked_batches = [batch] if accum_steps == 1 else chunk_batch_for_accum_steps(batch, accum_steps)
 
-            self._run_steps_on_batch_chunks(chunked_batches, phase, loss_meters)
+            step_ok = self._run_steps_on_batch_chunks(chunked_batches, phase, loss_meters)
+            if not step_ok:
+                for optim in self.optims:
+                    optim.zero_grad(set_to_none=True)
+                batch_time.update(time.time() - end)
+                end = time.time()
+                self.time_elapsed_meter.update(time.time() - self.start_time + self.ckpt_time_elapsed)
+                if torch.cuda.is_available():
+                    mem.update(torch.cuda.max_memory_allocated() // 1e9)
+                if data_iter % self.logging_conf.log_freq == 0:
+                    progress.display(data_iter)
+                continue
 
             # step schedulers
             exact_epoch = self.epoch + float(data_iter) / limit_train_batches
@@ -603,16 +616,25 @@ class Trainer:
                     loss_dict = self._step(chunked_batch, self.model, phase, loss_meters)
 
                 loss = loss_dict["loss_objective"]
-                loss_key = f"Loss/{phase}_loss_objective"
-                batch_size = chunked_batch["images"].shape[0]
+                local_loss_value = loss.item()
+                loss_is_finite = math.isfinite(local_loss_value)
+                if dist.is_available() and dist.is_initialized():
+                    finite_flag = torch.tensor(
+                        1.0 if loss_is_finite else 0.0,
+                        device=loss.device,
+                        dtype=torch.float32,
+                    )
+                    dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+                    loss_is_finite = bool(finite_flag.item())
 
-                if not math.isfinite(loss.item()):
-                    logging.error(f"Loss is {loss.item()}, stop training")
-                    return
+                if not loss_is_finite:
+                    logging.error(f"Loss is {local_loss_value}, skipping batch")
+                    return False
 
                 loss /= accum_steps
                 self.scaler.scale(loss).backward()
-                loss_meters[loss_key].update(loss.item(), batch_size)
+
+        return True
 
     def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
         tensor_keys = ["images", "depths", "extrinsics", "intrinsics", "cam_points", "world_points", "point_masks"]
@@ -663,6 +685,12 @@ class Trainer:
         for key in keys_to_log:
             if key in data:
                 value = data[key].item() if torch.is_tensor(data[key]) else data[key]
+                if not math.isfinite(float(value)):
+                    if self.rank == 0:
+                        python_logging.warning(
+                            "Skipping non-finite scalar %s/%s: %s", phase, key, value
+                        )
+                    continue
                 loss_meters[f"Loss/{phase}_{key}"].update(value, batch_size)
                 if step % self.logging_conf.log_freq == 0 and self.rank == 0:
                     self.tb_writer.log(f"Values/{phase}/{key}", value, step)

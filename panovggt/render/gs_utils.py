@@ -47,7 +47,31 @@ def patch_pool(x: torch.Tensor, patch_size: int) -> torch.Tensor:
         return x.reshape(B, S, C, Hp, Wp).contiguous()
 
 
-def depth_footprint_scale(depth: torch.Tensor, patch_size: int, H: int) -> torch.Tensor:
+def patch_valid_ratio(mask: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Average-pool a boolean/float valid mask to per-patch valid ratios."""
+    if mask.dim() == 5:
+        if mask.shape[-1] == 1:
+            mask = mask[..., 0]
+        elif mask.shape[2] == 1:
+            mask = mask[:, :, 0]
+        else:
+            raise ValueError(f"unexpected 5-D mask shape {mask.shape}")
+    if mask.dim() != 4:
+        raise ValueError(f"expected mask shape (B,S,H,W), got {mask.shape}")
+    pooled = F.avg_pool2d(
+        mask.float().flatten(0, 1).unsqueeze(1),
+        kernel_size=patch_size,
+        stride=patch_size,
+    ).squeeze(1)
+    return pooled.view(*mask.shape[:2], *pooled.shape[-2:])
+
+
+def depth_footprint_scale(
+    depth: torch.Tensor,
+    patch_size: int,
+    H: int,
+    valid_mask=None,
+) -> torch.Tensor:
     """
     Compute an isotropic init scale per patch from depth and angular pixel size.
 
@@ -66,11 +90,33 @@ def depth_footprint_scale(depth: torch.Tensor, patch_size: int, H: int) -> torch
     if depth.dim() == 5:
         depth = depth.squeeze(-1)
     angular = patch_size * math.pi / float(H)
-    pooled = F.avg_pool2d(
-        depth.flatten(0, 1).unsqueeze(1),
-        kernel_size=patch_size,
-        stride=patch_size,
-    ).squeeze(1)  # (B*S, Hp, Wp)
+    if valid_mask is not None:
+        if valid_mask.dim() == 5:
+            if valid_mask.shape[-1] == 1:
+                valid_mask = valid_mask[..., 0]
+            elif valid_mask.shape[2] == 1:
+                valid_mask = valid_mask[:, :, 0]
+            else:
+                raise ValueError(f"unexpected 5-D valid_mask shape {valid_mask.shape}")
+        valid = valid_mask.to(dtype=depth.dtype)
+        depth_sum = F.avg_pool2d(
+            (depth * valid).flatten(0, 1).unsqueeze(1),
+            kernel_size=patch_size,
+            stride=patch_size,
+        ).squeeze(1)
+        valid_ratio = F.avg_pool2d(
+            valid.flatten(0, 1).unsqueeze(1),
+            kernel_size=patch_size,
+            stride=patch_size,
+        ).squeeze(1)
+        pooled = depth_sum / valid_ratio.clamp_min(1e-6)
+        pooled = torch.where(valid_ratio > 0, pooled, torch.zeros_like(pooled))
+    else:
+        pooled = F.avg_pool2d(
+            depth.flatten(0, 1).unsqueeze(1),
+            kernel_size=patch_size,
+            stride=patch_size,
+        ).squeeze(1)  # (B*S, Hp, Wp)
     s = (pooled * angular).clamp_min(1e-4)
     s = s.view(*depth.shape[:2], *s.shape[-2:])  # (B,S,Hp,Wp)
     return s.unsqueeze(-1).expand(*s.shape, 3).contiguous()

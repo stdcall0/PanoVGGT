@@ -379,21 +379,12 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
 
             tokens_4d = tokens.reshape(B, S, P, C2)
 
-            if self.training:
-                anchor_idx = torch.randint(0, S, (B,), device=tokens.device)
-                context = (
-                    tokens_4d[torch.arange(B, device=tokens.device), anchor_idx]
-                    .unsqueeze(1)
-                    .expand(B, S, P, C2)
-                    .reshape(B * S, P, C2)
-                )
-            else:
-                mid_idx = S // 2
-                context = (
-                    tokens_4d[:, mid_idx : mid_idx + 1]
-                    .expand(B, S, P, C2)
-                    .reshape(B * S, P, C2)
-                )
+            mid_idx = S // 2
+            context = (
+                tokens_4d[:, mid_idx : mid_idx + 1]
+                .expand(B, S, P, C2)
+                .reshape(B * S, P, C2)
+            )
 
             pos_bs_global = self._get_branch_pos_embed(
                 patch_h, patch_w, patch_start_idx,

@@ -450,14 +450,19 @@ class PanoCityDataset(BaseDataset):
             max_frames = min(24, len(valid_frame_ids))
             img_per_seq = random.randint(2, max_frames)
         if ids is None:
-            ids = np.random.choice(valid_frame_ids, img_per_seq, replace=self.allow_duplicate_img)
+            ids = np.random.choice(
+                valid_frame_ids, img_per_seq,
+                replace=(self.allow_duplicate_img or len(valid_frame_ids) < img_per_seq)
+            )
 
         if self.get_nearby:
             ids = self.get_nearby_ids(ids, len(pano_images), expand_ratio=self.expand_ratio)
             ids = [int(i) for i in ids if int(i) in valid_frame_ids]
             if len(ids) < 2:
-                ids = np.random.choice(valid_frame_ids, max(2, img_per_seq),
-                                       replace=self.allow_duplicate_img).tolist()
+                ids = np.random.choice(
+                    valid_frame_ids, max(2, img_per_seq),
+                    replace=(self.allow_duplicate_img or len(valid_frame_ids) < img_per_seq)
+                ).tolist()
 
         
         unique_ids, seen = [], set()
@@ -494,7 +499,7 @@ class PanoCityDataset(BaseDataset):
                 depth_map = self._read_and_resize_depth(depth_path, target_resolution)
                 pose_w2c = self._c2w_to_w2c(pose_c2w)
 
-                    # Optional per-sample augmentation rotation.
+                # Optional per-sample augmentation rotation.
                 R_delta = self._prepare_augmentation_params()  # torch 3x3 or None
 
                 frame_data = self.process_one_image(
@@ -506,6 +511,10 @@ class PanoCityDataset(BaseDataset):
                     R_delta=R_delta,
                     depth_max=self.depth_max
                 )
+
+                if int(frame_data['valid_mask'].sum().item()) < 1024:
+                    logging.warning("Skipping frame with too few valid depth pixels")
+                    continue
 
                 processed_frames[idx] = {
                     'rgb': frame_data['rgb'],
@@ -541,8 +550,8 @@ class PanoCityDataset(BaseDataset):
                 img_filename = osp.basename(pano_images[idx])
                 logging.debug(f"Frame {img_filename} (list idx {idx}) was not processed, skipping")
 
-        if len(batch_data['images']) < 2:
-            logging.error(f"Not enough valid frames after processing. Retrying...")
+        if len(batch_data['images']) < img_per_seq:
+            logging.error("Not enough valid frames after processing for requested image count. Retrying...")
             return self.get_data(img_per_seq=img_per_seq, aspect_ratio=aspect_ratio)
 
         return {

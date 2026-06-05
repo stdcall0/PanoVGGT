@@ -336,6 +336,10 @@ class PointLoss(nn.Module):
         
         B, N, H, W, _ = pred_local_pts.shape
         
+        if not valid_masks.any():
+            zero = pred_local_pts.new_tensor(0.0)
+            scale = torch.ones(B, device=pred_local_pts.device, dtype=pred_local_pts.dtype)
+            return zero, {"local_pts_loss": zero, "normal_loss": zero}, scale
         # Compute depth weights (inverse radial distance)
         weights = torch.norm(gt_local_pts, dim=-1).sqrt()
         weights = weights.clamp_min(
@@ -607,6 +611,8 @@ class Loss(nn.Module):
         self._gs_photometric_mode = str(self.gs_conf.get("photometric_mode", "source_recon"))
         self._gs_target_policy = str(self.gs_conf.get("target_policy", "last"))
         self._gs_num_target_views = int(self.gs_conf.get("num_target_views", 1))
+        self._gs_self_recon = bool(self.gs_conf.get("self_recon", False))
+        self._gs_mask_rgb_by_valid = bool(self.gs_conf.get("mask_rgb_by_valid", True))
     
     def prepare_gt(self, gt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -681,8 +687,16 @@ class Loss(nn.Module):
         all_pts[~masks] = 0
         all_pts = all_pts.reshape(B, N, -1, 3)
         all_dis = all_pts.norm(dim=-1)
-        denom = masks.float().sum(dim=[-1, -2, -3]).clamp(min=1e-8)
-        norm_factor = all_dis.sum(dim=(1, 2)) / denom  # [B]
+        valid_count = masks.float().sum(dim=[-1, -2, -3])
+        raw_norm_factor = all_dis.sum(dim=(1, 2)) / valid_count.clamp(min=1e-8)
+        norm_factor = torch.where(
+            valid_count > 0,
+            raw_norm_factor,
+            torch.ones_like(raw_norm_factor),
+        )
+        norm_factor = torch.nan_to_num(
+            norm_factor, nan=1.0, posinf=1e6, neginf=1.0
+        ).clamp(min=1e-6, max=1e6)
 
         scale = norm_factor.view(B, 1, 1, 1, 1)
 
@@ -743,12 +757,29 @@ class Loss(nn.Module):
         # Normalize predictions
         pred = self.normalize_pred(pred, gt)
 
-        # Compute point and camera losses
-        point_loss, point_details, scale = self.point_loss(pred, gt)
-        cam_loss, cam_details = self.camera_loss(pred, gt, scale)
+        # Compute point and camera losses only when they can affect the objective.
+        # In GS-only training, evaluating these branches can turn bad-depth samples
+        # into 0*NaN and poison the render loss.
+        zero = pred["local_points"].new_tensor(0.0)
+        B = pred["local_points"].shape[0]
+        scale = torch.ones(B, device=zero.device, dtype=zero.dtype)
+        point_details: Dict[str, torch.Tensor] = {}
+        cam_details: Dict[str, torch.Tensor] = {}
+        point_loss = zero
+        cam_loss = zero
+
+        need_point_loss = self._point_loss_weight != 0.0 or self._camera_loss_weight != 0.0
+        if need_point_loss:
+            point_loss, point_details, scale = self.point_loss(pred, gt)
+        if self._camera_loss_weight != 0.0:
+            cam_loss, cam_details = self.camera_loss(pred, gt, scale)
 
         # Total objective loss
-        loss_objective = self._point_loss_weight * point_loss + self._camera_loss_weight * cam_loss
+        loss_objective = zero
+        if self._point_loss_weight != 0.0:
+            loss_objective = loss_objective + self._point_loss_weight * point_loss
+        if self._camera_loss_weight != 0.0:
+            loss_objective = loss_objective + self._camera_loss_weight * cam_loss
 
         # ---- Gaussian render loss ----------------------------------------
         gs_total = loss_objective.new_tensor(0.0)
@@ -764,8 +795,6 @@ class Loss(nn.Module):
             return torch.tensor(
                 x, device=loss_objective.device, dtype=loss_objective.dtype
             )
-
-        zero = loss_objective.new_tensor(0.0)
 
         # Construct unified loss dictionary
         loss_dict = {
@@ -814,6 +843,7 @@ class Loss(nn.Module):
             train_scale=bool(gs_conf.get("train_scale", False)),
             train_rotation=bool(gs_conf.get("train_rotation", False)),
             train_sh_rest=bool(gs_conf.get("train_sh_rest", False)),
+            min_valid_ratio=float(gs_conf.get("min_valid_ratio", 0.25)),
         )
 
     def _compute_gs_loss(self, pred: Dict[str, torch.Tensor], gt: Dict[str, torch.Tensor]):
@@ -879,15 +909,67 @@ class Loss(nn.Module):
                     selected[key] = value
             return selected
 
-        source_world_points = select_views(world_points, source_idx)
-        source_depth_pred = select_views(depth_pred, source_idx)
-        source_images = select_views(images, source_idx)
-        source_gs_params = select_gs_params(gs_params, source_idx)
-        render_camera_poses = select_views(camera_poses, target_idx)
-        target_images = select_views(images, target_idx)
-        target_depths = select_views(gt.get("depths", None), target_idx)
-        target_masks = select_views(gt.get("valid_masks", None), target_idx)
-        T = int(target_idx.numel())
+        def flatten_views(x: Optional[torch.Tensor]):
+            if x is None:
+                return None
+            return x.reshape(B * S, 1, *x.shape[2:])
+
+        def flatten_gs_params(params: Dict[str, torch.Tensor]):
+            flattened = {}
+            for key, value in params.items():
+                if isinstance(value, torch.Tensor):
+                    if value.dim() < 2 or value.shape[1] != S:
+                        raise ValueError(
+                            f"Gaussian param '{key}' must have source-view dim S={S}; "
+                            f"got {tuple(value.shape)}."
+                        )
+                    flattened[key] = value.reshape(B * S, 1, *value.shape[2:])
+                else:
+                    flattened[key] = value
+            return flattened
+
+        def canonical_depth(depth: Optional[torch.Tensor], num_views: int):
+            if depth is None:
+                return None
+            if depth.dim() == 5 and depth.shape[2] == 1:
+                depth = depth[:, :, 0]
+            elif depth.dim() == 5 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            elif depth.dim() != 4:
+                raise ValueError(
+                    f"unexpected tensor shape for GS depth target: {tuple(depth.shape)}"
+                )
+            return depth.reshape(B * num_views, 1, H, W).to(
+                dtype=world_points.dtype, device=world_points.device
+            )
+
+        def canonical_mask(mask_tensor: Optional[torch.Tensor], batch_views: int):
+            if mask_tensor is None:
+                return None
+            if mask_tensor.dim() == 5 and mask_tensor.shape[2] == 1:
+                mask_tensor = mask_tensor[:, :, 0]
+            elif mask_tensor.dim() == 5 and mask_tensor.shape[-1] == 1:
+                mask_tensor = mask_tensor[..., 0]
+            elif mask_tensor.dim() != 4:
+                raise ValueError(
+                    f"unexpected tensor shape for GS valid mask: {tuple(mask_tensor.shape)}"
+                )
+            return mask_tensor.reshape(batch_views, 1, H, W).to(
+                dtype=world_points.dtype, device=world_points.device
+            )
+
+        def apply_depth_normalization(depth_gt: Optional[torch.Tensor], num_views: int):
+            if depth_gt is None:
+                return None
+            if gt_norm_factor is not None and pred_norm_factor is not None:
+                depth_ratio = (
+                    gt_norm_factor.to(depth_gt.device, dtype=depth_gt.dtype)
+                    / pred_norm_factor.detach().to(depth_gt.device, dtype=depth_gt.dtype)
+                )
+                depth_ratio = depth_ratio.view(B, 1, 1, 1, 1).expand(B, num_views, 1, 1, 1)
+                depth_gt = depth_gt * depth_ratio.reshape(B * num_views, 1, 1, 1)
+            return depth_gt
+
         gt_norm_factor = gt.get("norm_factors", None)
         pred_norm_factor = pred.get("norm_factor", None)
 
@@ -903,57 +985,83 @@ class Loss(nn.Module):
         else:
             self.gs_branch.renderer.to(world_points.device)
 
-        out = self.gs_branch.render(
-            gs_params=source_gs_params,
-            world_points=source_world_points,
-            camera_poses_c2w=render_camera_poses,
-            images=source_images,
-            depth=source_depth_pred,
-        )
+        valid_masks = gt.get("valid_masks", None)
 
-        rgb_pred = out["rgb_erp"].reshape(B * T, 3, H, W)
-        depth_render = out["depth_erp"].reshape(B * T, 1, H, W)
-        mask = out["mask_erp"].reshape(B * T, 1, H, W)
+        if mode in ("source_recon", "reconstruction", "observed") and self._gs_self_recon:
+            # Render each source view only from its own Gaussian set. This avoids
+            # letting a union of all observed views explain every training target
+            # during the fragile bootstrap phase.
+            render_B = B * S
+            render_T = 1
+            flat_world_points = flatten_views(world_points)
+            flat_depth_pred = flatten_views(depth_pred)
+            flat_images = flatten_views(images)
+            flat_masks = flatten_views(valid_masks)
+            flat_camera_poses = flatten_views(camera_poses)
+            flat_gs_params = flatten_gs_params(gs_params)
 
-        rgb_gt = target_images.reshape(B * T, 3, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
+            out = self.gs_branch.render(
+                gs_params=flat_gs_params,
+                world_points=flat_world_points,
+                camera_poses_c2w=flat_camera_poses,
+                images=flat_images,
+                depth=flat_depth_pred,
+                point_masks=flat_masks,
+            )
 
-        depth_gt = target_depths
-        depth_mask = target_masks
-        if depth_gt is not None:
-            if depth_gt.dim() == 5 and depth_gt.shape[2] == 1:
-                depth_gt = depth_gt[:, :, 0]
-            elif depth_gt.dim() == 5 and depth_gt.shape[-1] == 1:
-                depth_gt = depth_gt[..., 0]
-            elif depth_gt.dim() != 4:
-                raise ValueError(
-                    f"unexpected tensor shape for GS depth target: {tuple(depth_gt.shape)}"
-                )
-            depth_gt = depth_gt.reshape(B * T, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
-            if gt_norm_factor is not None and pred_norm_factor is not None:
-                # Trainer-normalized GT depths are in gt_norm_factor units,
-                # while rendered depths are in pred_norm_factor units.
-                depth_ratio = (
-                    gt_norm_factor.to(rgb_pred.device, dtype=rgb_pred.dtype)
-                    / pred_norm_factor.detach().to(rgb_pred.device, dtype=rgb_pred.dtype)
-                )
-                depth_ratio = depth_ratio.view(B, 1, 1, 1, 1).expand(B, T, 1, 1, 1)
-                depth_gt = depth_gt * depth_ratio.reshape(B * T, 1, 1, 1)
-        if depth_mask is not None:
-            depth_mask = depth_mask.reshape(B * T, 1, H, W).to(rgb_pred.dtype).to(rgb_pred.device)
-
-        # Combine the boundary/cube mask with the GT validity mask if present.
-        if depth_mask is not None:
-            mask_full = mask * depth_mask
+            rgb_pred = out["rgb_erp"].reshape(render_B * render_T, 3, H, W)
+            depth_render = out["depth_erp"].reshape(render_B * render_T, 1, H, W)
+            render_mask = out["mask_erp"].reshape(render_B * render_T, 1, H, W)
+            rgb_gt = images.reshape(render_B * render_T, 3, H, W).to(
+                dtype=rgb_pred.dtype, device=rgb_pred.device
+            )
+            target_depths = canonical_depth(gt.get("depths", None), S)
+            target_depths = apply_depth_normalization(target_depths, S)
+            target_masks = canonical_mask(valid_masks, render_B)
         else:
-            mask_full = mask
+            source_world_points = select_views(world_points, source_idx)
+            source_depth_pred = select_views(depth_pred, source_idx)
+            source_images = select_views(images, source_idx)
+            source_masks = select_views(valid_masks, source_idx)
+            source_gs_params = select_gs_params(gs_params, source_idx)
+            render_camera_poses = select_views(camera_poses, target_idx)
+            target_images = select_views(images, target_idx)
+            target_depths_raw = select_views(gt.get("depths", None), target_idx)
+            target_masks_raw = select_views(valid_masks, target_idx)
+            T = int(target_idx.numel())
+
+            out = self.gs_branch.render(
+                gs_params=source_gs_params,
+                world_points=source_world_points,
+                camera_poses_c2w=render_camera_poses,
+                images=source_images,
+                depth=source_depth_pred,
+                point_masks=source_masks,
+            )
+
+            rgb_pred = out["rgb_erp"].reshape(B * T, 3, H, W)
+            depth_render = out["depth_erp"].reshape(B * T, 1, H, W)
+            render_mask = out["mask_erp"].reshape(B * T, 1, H, W)
+            rgb_gt = target_images.reshape(B * T, 3, H, W).to(
+                dtype=rgb_pred.dtype, device=rgb_pred.device
+            )
+            target_depths = canonical_depth(target_depths_raw, T)
+            target_depths = apply_depth_normalization(target_depths, T)
+            target_masks = canonical_mask(target_masks_raw, B * T)
+
+        if target_masks is not None:
+            valid_render_mask = render_mask * target_masks
+        else:
+            valid_render_mask = render_mask
+        rgb_mask = valid_render_mask if self._gs_mask_rgb_by_valid else render_mask
 
         return self.gs_loss(
             rgb_pred=rgb_pred,
             rgb_gt=rgb_gt,
-            mask=mask_full,
+            mask=rgb_mask,
             depth_pred=depth_render,
-            depth_gt=depth_gt,
-            depth_mask=mask_full if depth_gt is not None else None,
+            depth_gt=target_depths,
+            depth_mask=valid_render_mask if target_depths is not None else None,
         )
 
     def _select_gs_target_indices(self, num_views: int, device: torch.device) -> torch.Tensor:

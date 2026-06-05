@@ -68,7 +68,7 @@ def validate_param_group_params(param_groups: List[Dict], model: nn.Module):
         assert len(pg["params"]) == len(set(pg["params"]))
 
     parameters = [set(pg["params"]) for pg in param_groups]
-    model_parameters = {p for _, p in model.named_parameters()}
+    model_parameters = {p for _, p in model.named_parameters() if p.requires_grad}
 
     for p1, p2 in itertools.permutations(parameters, 2):
         assert p1.isdisjoint(p2), "Parameter groups should be disjoint"
@@ -215,7 +215,11 @@ def construct_optimizer(model: nn.Module,
     *No* allowlist handling – we always optimize *all* model parameters.
     """
 
-    named_parameters = dict(model.named_parameters())
+    named_parameters = {
+        name: param for name, param in model.named_parameters() if param.requires_grad
+    }
+    if not named_parameters:
+        raise ValueError("No trainable parameters found for optimizer construction")
     all_parameter_names = set(named_parameters.keys())
     module_cls_to_all_param_names = get_module_cls_to_param_names(model)
 
