@@ -726,9 +726,10 @@ def unproject_pano_depth_to_camera_coords(depth: torch.Tensor, shape: tuple) -> 
     h, w = shape
     device = depth.device
 
-    # Create spherical coordinates grid
-    v_normalized = torch.arange(h, device=device).float() / (h - 1)
-    u_normalized = torch.arange(w, device=device).float() / (w - 1)
+    # Create spherical coordinates at pixel centers. This matches
+    # PanoVGGTModel._get_direction_vectors and the cube renderer ERP grids.
+    v_normalized = (torch.arange(h, device=device).float() + 0.5) / h
+    u_normalized = (torch.arange(w, device=device).float() + 0.5) / w
     v_grid, u_grid = torch.meshgrid(v_normalized, u_normalized, indexing='ij')
 
     theta = (u_grid - 0.5) * (2 * math.pi)
@@ -797,8 +798,8 @@ def transform_pano_track_points(track: torch.Tensor, rot_matrix: torch.Tensor, s
 
     # 1. Un-project 2D pixel coordinates to 3D direction vectors
     u, v = track[:, 0], track[:, 1]
-    u_norm = u / (W - 1)
-    v_norm = v / (H - 1)
+    u_norm = (u + 0.5) / W
+    v_norm = (v + 0.5) / H
     theta = (u_norm - 0.5) * (2 * math.pi)
     phi = -(v_norm - 0.5) * math.pi
     x = torch.cos(phi) * torch.sin(theta)
@@ -817,7 +818,7 @@ def transform_pano_track_points(track: torch.Tensor, rot_matrix: torch.Tensor, s
     v_norm_new = (-phi_new / math.pi) + 0.5
 
     # 4. Convert back to pixel coordinates
-    u_new = u_norm_new * (W - 1)
-    v_new = v_norm_new * (H - 1)
+    u_new = u_norm_new * W - 0.5
+    v_new = v_norm_new * H - 0.5
 
     return torch.stack([u_new, v_new], dim=1).to(device)

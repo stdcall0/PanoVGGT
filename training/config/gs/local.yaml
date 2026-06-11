@@ -1,18 +1,19 @@
 # @package _global_
-# Local GS-head bootstrap config.
+# Local GS-head stage-2 refinement config.
 # Four datasets: Stanford2D3DS + Structured3D + PanoCity + Matterport3D.
-# Initial phase: source-view self reconstruction, no novel-view rendering.
+# Stage-2 resumes from stage-1 model weights and refines GS color, opacity, scale, and offset only.
 
 defaults:
   - /default
   - _self_
 
-exp_name: gs_local
+exp_name: gs_local_stage2
 
 max_epochs: 80
 accum_steps: 1
 max_img_per_gpu: 16
 max_img_per_gpu_val: 8
+limit_train_batches: 300
 limit_val_batches: 50
 
 model:
@@ -46,7 +47,7 @@ loss:
     train_rotation: False
     train_sh_rest: False
     rgb_weight: 1.0
-    ssim_weight: 0.1
+    ssim_weight: 0.0
     depth_weight: 0.0
     loss_weight: 1.0
     point_loss_weight: 0.0
@@ -66,8 +67,17 @@ optim:
     - gaussian_head.sh_rest
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 2e-6
-    weight_decay: 0.05
+    lr: 1e-6
+    weight_decay: 0.0
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 1e-6
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.0
   gradient_clip:
     _target_: train_utils.gradient_clip.GradientClipper
     configs:
@@ -78,7 +88,7 @@ optim:
 checkpoint:
   save_dir: ./outputs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: null
+  resume_checkpoint_path: ./outputs/gs_local/ckpts/stage1_model_only.pt
   strict: False
 
 logging:

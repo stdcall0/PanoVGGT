@@ -212,8 +212,11 @@ class TupleConcatDataset(ConcatDataset):
         else:
             sample_idx = idx - self.cumulative_sizes[dataset_idx - 1]
 
-        # Create the tuple to pass to the underlying dataset
-        if len(idx_tuple) == 3:
+        # Create the tuple to pass to the underlying dataset. Standard integer
+        # indexing is useful for smoke tests and plain DataLoader usage.
+        if idx_tuple is None:
+            idx_tuple = (sample_idx, None, 1.0)
+        elif len(idx_tuple) == 3:
             idx_tuple = (sample_idx,) + idx_tuple[1:]
         else:
             raise ValueError("Tuple index must have exactly three elements")

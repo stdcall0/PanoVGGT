@@ -1,0 +1,62 @@
+# @package _global_
+# Stage 1: bootstrap GS color/opacity from the official PanoVGGT checkpoint.
+# Only gaussian_head.sh_dc and gaussian_head.opacity are trainable.
+
+defaults:
+  - /gs/local
+  - _self_
+
+exp_name: gs_stage1_bootstrap
+max_epochs: 70
+limit_train_batches: 300
+limit_val_batches: 50
+
+loss:
+  gs:
+    use_offset: False
+    train_dc: True
+    train_opacity: True
+    train_scale: False
+    train_rotation: False
+    train_sh_rest: False
+
+optim:
+  frozen_module_names:
+    - aggregator
+    - point_decoder
+    - point_head
+    - camera_decoder
+    - camera_head
+    - global_points_decoder
+    - global_point_head
+    - pos_adapters
+    - gaussian_head.offset
+    - gaussian_head.scale
+    - gaussian_head.rotation
+    - gaussian_head.sh_rest
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 2e-6
+    weight_decay: 0.0
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 2e-6
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.0
+
+checkpoint:
+  save_dir: ./outputs/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: ./checkpoints/model.pt
+  strict: False
+
+logging:
+  log_dir: ./outputs/${exp_name}
+  log_exp: ${exp_name}
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ./outputs/tensorboard/${exp_name}

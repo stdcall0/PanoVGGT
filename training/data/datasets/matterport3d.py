@@ -151,16 +151,12 @@ class Matterport3DDataset(BaseDataset):
             with open(json_path, 'r') as f:
                 room_info = json.load(f)
 
-            color_dir = osp.join(scene_path, 'pano_skybox_color')
             depth_dir = osp.join(scene_path, 'pano_depth')
             pose_dir = osp.join(scene_path, 'pano_poses')
 
-            if not all(osp.isdir(d) for d in [color_dir, depth_dir, pose_dir]):
-                alt_color = osp.join(scene_path, 'pano_color')
-                if not all(osp.isdir(d) for d in [alt_color, depth_dir, pose_dir]):
-                    logging.warning(f"Missing required directories for scene {scene}, skipping")
-                    continue
-                color_dir = alt_color
+            if not all(osp.isdir(d) for d in [depth_dir, pose_dir]):
+                logging.warning(f"Missing required directories for scene {scene}, skipping")
+                continue
 
             for room_id, room_data in room_info.items():
                 room_name = room_data.get('room_name', f'room_{room_id}')
@@ -170,12 +166,10 @@ class Matterport3DDataset(BaseDataset):
 
                 valid_views = []
                 for pano_id in panoramas:
-                    cpath_png = osp.join(color_dir, f"{pano_id}.png")
-                    cpath_jpg = osp.join(color_dir, f"{pano_id}.jpg")
-                    cpath = cpath_png if osp.exists(cpath_png) else cpath_jpg
+                    cpath = self._resolve_color_path(scene_path, pano_id)
                     dpath = osp.join(depth_dir, f"{pano_id}.png")
                     ppath = osp.join(pose_dir, f"{pano_id}.txt")
-                    if cpath and osp.exists(cpath) and osp.exists(dpath) and osp.exists(ppath):
+                    if cpath is not None and osp.exists(dpath) and osp.exists(ppath):
                         valid_views.append(pano_id)
 
                 if len(valid_views) < self.min_num_images:
@@ -184,9 +178,9 @@ class Matterport3DDataset(BaseDataset):
                 # Read image size from header only (fast metadata access).
                 try:
                     first_view = valid_views[0]
-                    cpath_png = osp.join(color_dir, f"{first_view}.png")
-                    cpath_jpg = osp.join(color_dir, f"{first_view}.jpg")
-                    cpath = cpath_png if osp.exists(cpath_png) else cpath_jpg
+                    cpath = self._resolve_color_path(scene_path, first_view)
+                    if cpath is None:
+                        raise FileNotFoundError(f"No RGB panorama found for {scene}/{first_view}")
                     with Image.open(cpath) as img:
                         W, H = img.size
                     resolution = (H, W)
@@ -196,6 +190,16 @@ class Matterport3DDataset(BaseDataset):
 
         logging.info(f"Found {len(room_trajectories)} valid room trajectories")
         return room_trajectories
+
+    def _resolve_color_path(self, scene_path, view_name):
+        """Return the preferred existing Matterport panorama RGB path for a view."""
+        for dirname in ('pano_skybox_color_fixed', 'pano_skybox_color', 'pano_color'):
+            color_dir = osp.join(scene_path, dirname)
+            for ext in ('png', 'jpg'):
+                path = osp.join(color_dir, f"{view_name}.{ext}")
+                if osp.exists(path):
+                    return path
+        return None
 
     def _get_equi_rotate(self, equ_h: int):
         """Get or create a CPU EquirecRotate instance for a target height."""
@@ -310,9 +314,11 @@ class Matterport3DDataset(BaseDataset):
 
         Coordinate systems:
         - Matterport3D world:  X-right, Y-forward, Z-up
-        - Matterport3D camera: X-right, Y-up, Z-backward (OpenGL convention)
+        - Processed camera:    X-right, Y-down, Z-forward (OpenCV convention)
         - OpenCV world:        X-right, Y-down, Z-forward
         - OpenCV camera:       X-right, Y-down, Z-forward
+        The processed pano_poses files already include the Matterport/OpenGL
+        camera-axis flip. Only the world axes need conversion here.
         """
         try:
             pose_c2w_mp3d = np.loadtxt(path, dtype=np.float32)
@@ -320,12 +326,6 @@ class Matterport3DDataset(BaseDataset):
                 logging.error(f"Invalid pose matrix shape {pose_c2w_mp3d.shape} in {path}")
                 return None
 
-            T_cam_mp3d_to_opencv = np.array([
-                [1, 0, 0, 0],
-                [0, -1, 0, 0],
-                [0, 0, -1, 0],
-                [0, 0, 0, 1]
-            ], dtype=np.float32)
 
             T_world_mp3d_to_opencv = np.array([
                 [1, 0, 0, 0],
@@ -334,7 +334,7 @@ class Matterport3DDataset(BaseDataset):
                 [0, 0, 0, 1]
             ], dtype=np.float32)
 
-            pose_c2w_opencv = T_world_mp3d_to_opencv @ pose_c2w_mp3d @ np.linalg.inv(T_cam_mp3d_to_opencv)
+            pose_c2w_opencv = T_world_mp3d_to_opencv @ pose_c2w_mp3d
             return pose_c2w_opencv
         except Exception as e:
             logging.error(f"Error reading pose from {path}: {e}")
@@ -403,12 +403,11 @@ class Matterport3DDataset(BaseDataset):
             idx = int(idx)
             view_name = valid_views[idx]
 
-            color_dir = osp.join(self.Matterport3D_DIR, scene, 'pano_skybox_color')
-            if not osp.exists(color_dir):
-                color_dir = osp.join(self.Matterport3D_DIR, scene, 'pano_color')
-            color_png = osp.join(color_dir, f"{view_name}.png")
-            color_jpg = osp.join(color_dir, f"{view_name}.jpg")
-            color_path = color_png if osp.exists(color_png) else color_jpg
+            scene_path = osp.join(self.Matterport3D_DIR, scene)
+            color_path = self._resolve_color_path(scene_path, view_name)
+            if color_path is None:
+                logging.warning(f"Missing RGB panorama for {scene}/{view_name}")
+                continue
 
             depth_path = osp.join(self.Matterport3D_DIR, scene, 'pano_depth', f"{view_name}.png")
             pose_path  = osp.join(self.Matterport3D_DIR, scene, 'pano_poses', f"{view_name}.txt")
