@@ -19,7 +19,7 @@ loss:
     target_policy: last
     num_target_views: 1
     self_recon: False
-    mask_rgb_by_valid: False
+    mask_rgb_by_valid: True
     rgb_loss_type: charbonnier
     charbonnier_eps: 0.001
     solid_angle_weight: True

@@ -31,7 +31,7 @@ loss:
     enabled: True
     photometric_mode: source_recon
     self_recon: True
-    mask_rgb_by_valid: False
+    mask_rgb_by_valid: True
     renderer: cube
     face_res: 256
     fov_deg: 95.0
