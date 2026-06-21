@@ -1213,7 +1213,8 @@ class Loss(nn.Module):
         if self._gs_scale_reg_weight > 0.0:
             scale_mult = out.get("scale_mult", None)
             if scale_mult is not None:
-                scale_reg = F.relu(scale_mult - self._gs_scale_reg_target).square().mean()
+                target = scale_mult.new_tensor(self._gs_scale_reg_target).clamp_min(1e-6)
+                scale_reg = torch.log(scale_mult.clamp_min(1e-6) / target).square().mean()
                 gs_details["scale_reg"] = scale_reg
                 gs_total = gs_total + self._gs_scale_reg_weight * scale_reg
                 gs_details["total"] = gs_total

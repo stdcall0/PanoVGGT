@@ -150,3 +150,33 @@ def test_aggregate_predictions_passes_point_masks_to_materialization():
 
     assert agg["opacities"][0].item() == 0.0
     assert agg["opacities"][-1].item() == 1.0
+
+
+def test_smooth_bounded_scale_starts_at_unit_multiplier():
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    branch = _make_branch(scale_mult_min=0.25, scale_mult_max=1.25)
+    branch.train_flags["scale"] = True
+
+    out = branch.materialize(gs_params, world_points, images)
+
+    torch.testing.assert_close(out["scale_mult"], torch.ones_like(out["scale_mult"]))
+
+
+def test_smooth_bounded_scale_keeps_gradients_near_upper_bound():
+    gs_params = _make_gs_params()
+    gs_params["scale"] = (
+        torch.full_like(gs_params["scale"], 0.01) * torch.exp(torch.tensor(3.0))
+    )
+    gs_params["scale"].requires_grad_()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    branch = _make_branch(scale_mult_min=0.25, scale_mult_max=1.25)
+    branch.train_flags["scale"] = True
+
+    out = branch.materialize(gs_params, world_points, images)
+    out["scales"].sum().backward()
+
+    assert out["scale_mult"].max().item() < 1.25
+    assert gs_params["scale"].grad.abs().sum().item() > 0.0

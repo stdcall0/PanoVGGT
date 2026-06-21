@@ -22,6 +22,33 @@ from panovggt.utils.geometry import se3_inverse
 from .gs_utils import patch_pool, patch_valid_ratio, depth_footprint_scale, knn_scale
 
 
+def _smooth_bounded_scale_multiplier(
+    raw_scale: torch.Tensor,
+    scale_init_value: float,
+    scale_mult_min: Optional[float],
+    scale_mult_max: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert positive head scale output into a smooth bounded multiplier."""
+    scale_ref = max(float(scale_init_value), 1e-6)
+    scale_log_raw = torch.log(raw_scale.clamp_min(1e-8) / scale_ref)
+    log_mult = scale_log_raw
+    if scale_mult_min is not None:
+        min_log = abs(torch.log(raw_scale.new_tensor(float(scale_mult_min))).item())
+        log_mult = torch.where(
+            scale_log_raw < 0,
+            -min_log * torch.tanh(-scale_log_raw),
+            log_mult,
+        )
+    if scale_mult_max is not None:
+        max_log = torch.log(raw_scale.new_tensor(float(scale_mult_max))).item()
+        log_mult = torch.where(
+            scale_log_raw >= 0,
+            max_log * torch.tanh(scale_log_raw),
+            log_mult,
+        )
+    return torch.exp(log_mult), scale_log_raw
+
+
 class GSBranch:
     """Stateless helper bound to a stage config. Renders and returns tensors."""
 
@@ -154,14 +181,16 @@ class GSBranch:
         # softplus output is initialized to scale_init_value, so this starts at
         # scale_init and learns a positive multiplicative correction.
         if self.train_flags["scale"]:
-            scale_mult_raw = gs_params["scale"] / max(float(self.scale_init_value), 1e-6)
-            scale_mult = scale_mult_raw
-            if self.scale_mult_min is not None or self.scale_mult_max is not None:
-                scale_mult = scale_mult.clamp(min=self.scale_mult_min, max=self.scale_mult_max)
+            scale_mult, scale_log_raw = _smooth_bounded_scale_multiplier(
+                raw_scale=gs_params["scale"],
+                scale_init_value=self.scale_init_value,
+                scale_mult_min=self.scale_mult_min,
+                scale_mult_max=self.scale_mult_max,
+            )
             scale_final = scale_init.detach() * scale_mult
         else:
-            scale_mult_raw = torch.ones_like(scale_init)
-            scale_mult = scale_mult_raw
+            scale_log_raw = torch.zeros_like(scale_init)
+            scale_mult = torch.ones_like(scale_init)
             scale_final = scale_init.detach()
 
         # rotation
@@ -200,7 +229,8 @@ class GSBranch:
             offset=offset,
             scales=scale_final,
             scale_init=scale_init,
-            scale_mult=scale_mult_raw,
+            scale_mult=scale_mult,
+            scale_log_raw=scale_log_raw,
             scale_mult_clamped=scale_mult,
             rotations=rotation_final,
             opacities=opacity_final,
@@ -232,7 +262,6 @@ class GSBranch:
         centers = materialized["centers"]
         scale_final = materialized["scales"]
         scale_init = materialized["scale_init"]
-        scale_mult_raw = materialized["scale_mult"]
         scale_mult = materialized["scale_mult_clamped"]
         offset = materialized["offset"]
         rotation_final = materialized["rotations"]
@@ -277,7 +306,8 @@ class GSBranch:
             offset=offset,
             scales=scale_final,
             scale_init=scale_init,
-            scale_mult=scale_mult_raw,
+            scale_mult=scale_mult,
+            scale_log_raw=materialized.get("scale_log_raw"),
             scale_mult_clamped=scale_mult,
             rotations=rotation_final,
             opacities=opacity_final,
