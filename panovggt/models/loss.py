@@ -613,7 +613,7 @@ class Loss(nn.Module):
         self._gs_target_policy = str(self.gs_conf.get("target_policy", "last"))
         self._gs_num_target_views = int(self.gs_conf.get("num_target_views", 1))
         self._gs_self_recon = bool(self.gs_conf.get("self_recon", False))
-        self._gs_mask_rgb_by_valid = bool(self.gs_conf.get("mask_rgb_by_valid", True))
+        self._gs_mask_rgb_by_valid = bool(self.gs_conf.get("mask_rgb_by_valid", False))
         self._gs_scale_reg_weight = float(self.gs_conf.get("scale_reg_weight", 0.0))
         self._gs_scale_reg_target = float(self.gs_conf.get("scale_reg_target", 1.0))
         self._gs_coverage_weight = float(self.gs_conf.get("coverage_weight", 0.0))
@@ -656,11 +656,21 @@ class Loss(nn.Module):
         # Convert w2c to c2w
         poses_c2w = se3_inverse(poses_w2c)
         
+        point_masks = gt['point_masks']
+        rgb_masks = gt.get('rgb_masks', gt.get('image_masks', None))
+        if rgb_masks is None:
+            rgb_masks = torch.ones_like(point_masks, dtype=torch.bool)
+        depth_masks = gt.get('depth_masks', gt.get('valid_depth_masks', point_masks))
+        source_gs_masks = gt.get('source_gs_masks', gt.get('gs_masks', point_masks))
+
         return {
             'imgs': gt['images'],
             'global_points': gt['world_points'],
             'local_points': gt['cam_points'],
-            'valid_masks': gt['point_masks'],
+            'valid_masks': point_masks,
+            'rgb_masks': rgb_masks,
+            'depth_masks': depth_masks,
+            'source_gs_masks': source_gs_masks,
             'camera_poses': poses_c2w,
             'depths': gt.get('depths', None),
             'norm_factors': gt.get('norm_factors', None),
@@ -1004,6 +1014,9 @@ class Loss(nn.Module):
             self.gs_branch.renderer.to(world_points.device)
 
         valid_masks = gt.get("valid_masks", None)
+        depth_masks = gt.get("depth_masks", valid_masks)
+        source_gs_masks = gt.get("source_gs_masks", valid_masks)
+        rgb_masks = gt.get("rgb_masks", None)
 
         if mode in ("source_recon", "reconstruction", "observed") and self._gs_self_recon:
             # Render each source view only from its own Gaussian set. This avoids
@@ -1015,7 +1028,7 @@ class Loss(nn.Module):
             flat_world_points = flatten_views(world_points)
             flat_depth_pred = flatten_views(depth_pred)
             flat_images = flatten_views(images)
-            flat_masks = flatten_views(valid_masks)
+            flat_masks = flatten_views(source_gs_masks)
             flat_camera_poses = flatten_views(camera_poses)
             flat_gs_params = flatten_gs_params(gs_params)
 
@@ -1039,18 +1052,20 @@ class Loss(nn.Module):
             pred_target_depths = canonical_depth(
                 depth_pred.detach() if depth_pred is not None else None, S
             )
-            target_masks = canonical_mask(valid_masks, render_B)
+            target_depth_masks = canonical_mask(depth_masks, render_B)
+            target_rgb_masks = canonical_mask(rgb_masks, render_B)
         else:
             source_world_points = select_views(world_points, source_idx)
             source_depth_pred = select_views(depth_pred, source_idx)
             source_images = select_views(images, source_idx)
-            source_masks = select_views(valid_masks, source_idx)
+            source_masks = select_views(source_gs_masks, source_idx)
             source_gs_params = select_gs_params(gs_params, source_idx)
             render_camera_poses = select_views(camera_poses, target_idx)
             target_images = select_views(images, target_idx)
             target_depths_raw = select_views(gt.get("depths", None), target_idx)
             target_pred_depths_raw = select_views(depth_pred.detach(), target_idx) if depth_pred is not None else None
-            target_masks_raw = select_views(valid_masks, target_idx)
+            target_depth_masks_raw = select_views(depth_masks, target_idx)
+            target_rgb_masks_raw = select_views(rgb_masks, target_idx)
             T = int(target_idx.numel())
 
             out = self.gs_branch.render(
@@ -1071,14 +1086,23 @@ class Loss(nn.Module):
             target_depths = canonical_depth(target_depths_raw, T)
             target_depths = apply_depth_normalization(target_depths, T)
             pred_target_depths = canonical_depth(target_pred_depths_raw, T)
-            target_masks = canonical_mask(target_masks_raw, B * T)
+            target_depth_masks = canonical_mask(target_depth_masks_raw, B * T)
+            target_rgb_masks = canonical_mask(target_rgb_masks_raw, B * T)
 
         alpha_render = out["alpha_erp"].reshape(B * T, 1, H, W).clamp(0.0, 1.0)
-        if target_masks is not None:
-            valid_render_mask = render_mask * target_masks
+        if target_depth_masks is not None:
+            depth_render_mask = render_mask * target_depth_masks
         else:
-            valid_render_mask = render_mask
-        rgb_mask = valid_render_mask if self._gs_mask_rgb_by_valid else render_mask
+            depth_render_mask = render_mask
+        if target_rgb_masks is not None:
+            rgb_render_mask = render_mask * target_rgb_masks
+        else:
+            rgb_render_mask = render_mask
+        rgb_mask = (
+            rgb_render_mask * target_depth_masks
+            if self._gs_mask_rgb_by_valid and target_depth_masks is not None
+            else rgb_render_mask
+        )
 
         gs_total, gs_details = self.gs_loss(
             rgb_pred=rgb_pred,
@@ -1086,12 +1110,12 @@ class Loss(nn.Module):
             mask=rgb_mask,
             depth_pred=depth_render,
             depth_gt=target_depths,
-            depth_mask=valid_render_mask if target_depths is not None else None,
+            depth_mask=depth_render_mask if target_depths is not None else None,
         )
         if self._gs_coverage_weight > 0.0:
             coverage_target = alpha_render.new_tensor(self._gs_coverage_target_alpha)
             coverage_err = F.relu(coverage_target - alpha_render).square()
-            coverage = (coverage_err * valid_render_mask).sum() / (valid_render_mask.sum() + 1e-6)
+            coverage = (coverage_err * rgb_mask).sum() / (rgb_mask.sum() + 1e-6)
             gs_details["coverage"] = coverage
             gs_total = gs_total + self._gs_coverage_weight * coverage
             gs_details["total"] = gs_total
@@ -1104,7 +1128,7 @@ class Loss(nn.Module):
             if surface_depth is not None:
                 margin = depth_render.new_tensor(self._gs_front_floater_margin)
                 front_err = F.relu(surface_depth - depth_render - margin).square()
-                front_weight = alpha_render * valid_render_mask
+                front_weight = alpha_render * depth_render_mask
                 front_floater = (front_err * front_weight).sum() / (front_weight.sum() + 1e-6)
                 gs_details["front_floater"] = front_floater
                 gs_total = gs_total + self._gs_front_floater_weight * front_floater
