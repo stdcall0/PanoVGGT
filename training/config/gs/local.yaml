@@ -94,8 +94,9 @@ optim:
 checkpoint:
   save_dir: ./outputs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: ./outputs/gs_stage1_bootstrap/ckpts/checkpoint.pt
+  resume_checkpoint_path: null
   # resume_checkpoint_path: ./outputs/gs_local_stage2/ckpts/checkpoint.pt
+  init_checkpoint_path: ./outputs/gs_stage1_bootstrap/ckpts/checkpoint.pt
   strict: False
 
 logging:

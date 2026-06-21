@@ -49,6 +49,29 @@ def _safe_barrier(local_rank: int):
         dist.barrier()
 
 
+def _conf_get(conf: Any, key: str, default: Any = None) -> Any:
+    return getattr(conf, key, default)
+
+
+def _select_checkpoint_paths(checkpoint_conf: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return (resume_path, init_path) with true resume taking precedence.
+
+    `resume_checkpoint_path` and auto-resume from `save_dir` restore trainer state.
+    `init_checkpoint_path` only initializes model weights for a new stage.
+    """
+    explicit_resume = _conf_get(checkpoint_conf, "resume_checkpoint_path")
+    if explicit_resume:
+        return explicit_resume, None
+
+    save_dir = _conf_get(checkpoint_conf, "save_dir")
+    auto_resume = get_resume_checkpoint(save_dir) if save_dir else None
+    if auto_resume:
+        return auto_resume, None
+
+    init_path = _conf_get(checkpoint_conf, "init_checkpoint_path")
+    return None, init_path
+
+
 class Trainer:
     """
     A generic trainer for DDP training. This should naturally support multi-node training.
@@ -128,10 +151,15 @@ class Trainer:
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.4f")
 
         # 5) Restore model weights before DDP wrapping.
-        ckpt_path = self.checkpoint_conf.resume_checkpoint_path or get_resume_checkpoint(self.checkpoint_conf.save_dir)
-        if ckpt_path is not None:
-            
-            self._load_resuming_checkpoint(ckpt_path, load_model=True, load_optim=False)
+        resume_ckpt_path, init_ckpt_path = _select_checkpoint_paths(self.checkpoint_conf)
+        model_ckpt_path = resume_ckpt_path or init_ckpt_path
+        if model_ckpt_path is not None:
+            self._load_resuming_checkpoint(
+                model_ckpt_path,
+                load_model=True,
+                load_optim=False,
+                load_train_state=False,
+            )
 
         # 6) Wrap model with DDP after device placement.
         self._setup_ddp_distributed_training(distributed, device)
@@ -140,9 +168,14 @@ class Trainer:
         if self.mode != "val":
             self.optims = construct_optimizers(self.model, self.optim_conf)
 
-        # Restore optimizer/scaler state if resuming training.
-        if ckpt_path is not None and self.mode == "train":
-            self._load_resuming_checkpoint(ckpt_path, load_model=False, load_optim=True)
+        # Restore optimizer/scaler/epoch only for a real same-stage resume.
+        if resume_ckpt_path is not None:
+            self._load_resuming_checkpoint(
+                resume_ckpt_path,
+                load_model=False,
+                load_optim=(self.mode == "train"),
+                load_train_state=True,
+            )
 
         # 8) DDP DataLoader / Dataset
         self._setup_dataloaders()
@@ -173,7 +206,13 @@ class Trainer:
         )
         self.rank = dist.get_rank()
 
-    def _load_resuming_checkpoint(self, ckpt_path: str, load_model: bool = True, load_optim: bool = True):
+    def _load_resuming_checkpoint(
+        self,
+        ckpt_path: str,
+        load_model: bool = True,
+        load_optim: bool = True,
+        load_train_state: bool = True,
+    ):
         """Loads model/optimizer/scaler from checkpoint with DDP-awareness."""
         logging.info(f"Resuming from {ckpt_path} (rank {self.rank})")
         with g_pathmgr.open(ckpt_path, "rb") as f:
@@ -213,22 +252,23 @@ class Trainer:
                     logging.warning(f"Failed to load optimizer state: {e}")
 
         
-        if train_conf:
-            self.epoch = 0
-            self.steps = {"train": 0, "val": 0}
-            self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
-        else:
-            if "prev_epoch" in checkpoint:
-                self.epoch = checkpoint["prev_epoch"] + 1
-            elif "epoch" in checkpoint:
-                self.epoch = checkpoint["epoch"]
-            else:
+        if load_train_state:
+            if train_conf:
                 self.epoch = 0
-            self.steps = checkpoint.get("steps", {"train": 0, "val": 0})
-            self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
+                self.steps = {"train": 0, "val": 0}
+                self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
+            else:
+                if "prev_epoch" in checkpoint:
+                    self.epoch = checkpoint["prev_epoch"] + 1
+                elif "epoch" in checkpoint:
+                    self.epoch = checkpoint["epoch"]
+                else:
+                    self.epoch = 0
+                self.steps = checkpoint.get("steps", {"train": 0, "val": 0})
+                self.ckpt_time_elapsed = checkpoint.get("time_elapsed", 0)
 
         # 4) AMP scaler
-        if hasattr(self, "scaler") and self.optim_conf.amp.enabled and "scaler" in checkpoint:
+        if load_train_state and hasattr(self, "scaler") and self.optim_conf.amp.enabled and "scaler" in checkpoint:
             if train_conf:
                 logging.info(f"[Confidence] Reset AMP scaler state (skip loading).")
             else:

@@ -121,6 +121,7 @@ checkpoint:
   save_dir: /public/home/v-guoyj/workspace/panopd/logs/${exp_name}/ckpts
   save_freq: 5
   resume_checkpoint_path: null
+  init_checkpoint_path: null
   strict: False
 
 

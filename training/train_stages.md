@@ -9,9 +9,11 @@ This is the compact training map for the 3DGS head. The active configs keep
 - Stage 1 starts from a PanoVGGT checkpoint without `gaussian_head.*` weights.
 - Do not resume these stages from old 1x Gaussian-head checkpoints; the 2x2
   head has different parameter shapes.
-- Each stage config defaults to the previous stage checkpoint.
-- To continue an interrupted stage, switch to the commented self-resume
-  `resume_checkpoint_path` in that stage config.
+- Each stage config uses `init_checkpoint_path` to initialize model weights from
+  the base model or previous stage while starting fresh epoch/optimizer/scaler
+  state.
+- `resume_checkpoint_path` is only for continuing an interrupted run of the same
+  stage. Keep previous-stage checkpoints out of `resume_checkpoint_path`.
 
 ## Stages
 

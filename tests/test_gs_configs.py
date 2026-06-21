@@ -30,3 +30,20 @@ def test_stage2c_novel_view_config_uses_trainer_side_bootstrap_contract():
     assert cfg.loss.gs.num_target_views == 1
     assert cfg.loss.gs.train_rotation is False
     assert cfg.loss.gs.train_sh_rest is False
+
+
+def test_gs_stage_configs_use_init_checkpoint_for_stage_handoff():
+    expected_init_paths = {
+        "stage1_bootstrap.yaml": "./checkpoints/model.pt",
+        "stage2_refine.yaml": "./outputs/gs_stage1_bootstrap/ckpts/checkpoint.pt",
+        "stage2b_coverage.yaml": "./outputs/gs_stage2_refine/ckpts/checkpoint.pt",
+        "stage2c_novel_view.yaml": "./outputs/gs_stage2b_coverage/ckpts/checkpoint.pt",
+        "stage3_full_head.yaml": "./outputs/gs_stage2c_novel_view/ckpts/checkpoint.pt",
+        "local.yaml": "./outputs/gs_stage1_bootstrap/ckpts/checkpoint.pt",
+    }
+
+    for config_name, init_path in expected_init_paths.items():
+        cfg = _load_config(config_name)
+
+        assert cfg.checkpoint.resume_checkpoint_path is None
+        assert cfg.checkpoint.init_checkpoint_path == init_path
