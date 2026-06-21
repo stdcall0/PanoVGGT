@@ -52,6 +52,7 @@ checkpoint:
   save_dir: ./outputs/${exp_name}/ckpts
   save_freq: 5
   resume_checkpoint_path: ./checkpoints/model.pt
+  # resume_checkpoint_path: ./outputs/gs_stage1_bootstrap/ckpts/checkpoint.pt
   strict: False
 
 logging:
