@@ -19,6 +19,7 @@ from typing import Dict, Optional
 import torch
 
 from panovggt.utils.geometry import se3_inverse
+from .gs_geometry import normalize_quaternion, quat_multiply, tangent_frame_quaternions
 from .gs_utils import patch_pool, patch_valid_ratio, depth_footprint_scale, knn_scale
 
 
@@ -74,6 +75,7 @@ class GSBranch:
         train_scale: bool = False,
         train_rotation: bool = False,
         train_sh_rest: bool = False,
+        rotation_init_mode: str = "identity",
         min_valid_ratio: float = 0.25,
         gs_head=None,                                # used to gate trainables
     ):
@@ -88,6 +90,7 @@ class GSBranch:
         self.use_offset = use_offset
         self.detach_centers = detach_centers
         self.detach_camera = detach_camera
+        self.rotation_init_mode = str(rotation_init_mode)
         self.min_valid_ratio = float(min_valid_ratio)
         self.gs_head = gs_head
 
@@ -202,11 +205,20 @@ class GSBranch:
             centers = centers_pp
 
         # rotation
-        if self.train_flags["rotation"]:
-            rotation_final = gs_params["rotation"]
+        if self.rotation_init_mode == "tangent":
+            rotation_init = tangent_frame_quaternions(centers_pp.detach())
+        elif self.rotation_init_mode == "identity":
+            rotation_init = gs_params["rotation"].new_zeros(gs_params["rotation"].shape)
+            rotation_init[..., 0] = 1.0
         else:
-            rotation_final = gs_params["rotation"].new_zeros(gs_params["rotation"].shape)
-            rotation_final[..., 0] = 1.0
+            raise ValueError(
+                f"unknown rotation_init_mode '{self.rotation_init_mode}', "
+                "expected 'identity' or 'tangent'."
+            )
+        if self.train_flags["rotation"]:
+            rotation_final = quat_multiply(rotation_init, gs_params["rotation"])
+        else:
+            rotation_final = normalize_quaternion(rotation_init)
 
         # opacity
         opacity_final = gs_params["opacity"]
@@ -348,6 +360,7 @@ def materialize_gaussians(
     branch.use_offset = bool(gs_conf.get("use_offset", False))
     branch.detach_centers = bool(gs_conf.get("detach_centers", True))
     branch.detach_camera = bool(gs_conf.get("detach_camera", True))
+    branch.rotation_init_mode = str(gs_conf.get("rotation_init_mode", "identity"))
     branch.gs_head = None
     branch.train_flags = dict(
         sh_dc=bool(gs_conf.get("train_dc", True)),

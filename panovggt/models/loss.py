@@ -879,6 +879,7 @@ class Loss(nn.Module):
             train_scale=bool(gs_conf.get("train_scale", False)),
             train_rotation=bool(gs_conf.get("train_rotation", False)),
             train_sh_rest=bool(gs_conf.get("train_sh_rest", False)),
+            rotation_init_mode=str(gs_conf.get("rotation_init_mode", "identity")),
             min_valid_ratio=float(gs_conf.get("min_valid_ratio", 0.25)),
         )
 

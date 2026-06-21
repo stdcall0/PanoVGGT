@@ -31,6 +31,7 @@ loss:
     train_scale: True
     train_rotation: False
     train_sh_rest: False
+    rotation_init_mode: tangent
 
 optim:
   frozen_module_names:

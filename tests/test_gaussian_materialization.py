@@ -16,6 +16,7 @@ def _make_branch(**overrides):
     branch.use_offset = False
     branch.detach_centers = True
     branch.detach_camera = True
+    branch.rotation_init_mode = "identity"
     branch.min_valid_ratio = 0.25
     branch.gs_head = None
     branch.train_flags = {
@@ -211,3 +212,19 @@ def test_scale_relative_offset_is_bounded_and_keeps_gradients():
     assert out["offset"].abs().max().item() < 0.005
     assert out["offset_ratio"].abs().max().item() < 0.5
     assert gs_params["offset"].grad.abs().sum().item() > 0.0
+
+
+def test_tangent_rotation_init_aligns_local_z_to_center_ray():
+    from panovggt.utils.rotation import quat_to_mat
+
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    world_points[..., 0] = 1.0
+    images = torch.zeros(1, 1, 3, 4, 4)
+    branch = _make_branch(rotation_init_mode="tangent")
+
+    out = branch.materialize(gs_params, world_points, images)
+    rot = quat_to_mat(out["rotations"])
+
+    torch.testing.assert_close(rot[..., :, 2], torch.tensor([1.0, 0.0, 0.0]).expand(1, 1, 2, 2, 3))
+    torch.testing.assert_close(out["rotations"].norm(dim=-1), torch.ones(1, 1, 2, 2))
