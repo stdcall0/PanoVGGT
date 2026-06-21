@@ -1051,9 +1051,16 @@ class Loss(nn.Module):
             target_c2w = select_views(gt_camera_poses, target_view_idx)
             rel = torch.matmul(anchor_w2c.float(), target_c2w.float()).to(camera_poses.dtype)
             if pred_norm_factor is not None:
-                rel[..., :3, 3] /= pred_norm_factor.detach().view(B, 1, 1).to(
+                pred_scale = pred_norm_factor.detach().view(B, 1, 1).to(
                     device=rel.device, dtype=rel.dtype
                 )
+                if gt_norm_factor is not None:
+                    gt_scale = gt_norm_factor.view(B, 1, 1).to(
+                        device=rel.device, dtype=rel.dtype
+                    )
+                    rel[..., :3, 3] *= gt_scale / pred_scale
+                else:
+                    rel[..., :3, 3] /= pred_scale
             return rel
 
         sh_dim = gs_params["sh_rest"].shape[-1]        # 3*sh_extra/3 = sh_extra

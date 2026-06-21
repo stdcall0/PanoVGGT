@@ -236,3 +236,54 @@ def test_trainer_side_novel_view_split_uses_full_gt_target_only_as_target():
         fake_branch.camera_poses_c2w[:, :, 0, 3],
         torch.tensor([[2.0]]),
     )
+
+
+def test_trainer_side_novel_view_gt_target_pose_matches_pred_scale():
+    loss = Loss(
+        train_conf=False,
+        gs={
+            "enabled": True,
+            "photometric_mode": "novel_view",
+            "view_split_location": "trainer",
+            "bootstrap_geometry_source": "gt",
+            "mask_rgb_by_valid": False,
+            "rgb_weight": 1.0,
+            "ssim_weight": 0.0,
+            "depth_weight": 0.0,
+            "point_loss_weight": 0.0,
+            "camera_loss_weight": 0.0,
+        },
+    )
+    fake_branch = _FakeBranch()
+    loss.gs_branch = fake_branch
+    loss.gs_loss = _CaptureRenderLoss()
+
+    gt_poses = _identity_poses(views=3)
+    gt_poses[:, 2, 0, 3] = 2.0
+    pred = {
+        "gs_world_points": torch.zeros(1, 2, 2, 2, 3),
+        "gs_camera_poses": _identity_poses(views=2),
+        "depth": torch.ones(1, 2, 2, 2, 1),
+        "gaussian": _minimal_gaussian_params(views=2),
+        "images": torch.zeros(1, 2, 3, 2, 2),
+        "gs_source_indices": torch.tensor([0, 1]),
+        "gs_target_indices": torch.tensor([2]),
+        "norm_factor": torch.tensor([4.0]),
+    }
+    gt = {
+        "imgs": torch.zeros(1, 3, 3, 2, 2),
+        "depths": torch.ones(1, 3, 2, 2),
+        "valid_masks": torch.ones(1, 3, 2, 2, dtype=torch.bool),
+        "rgb_masks": torch.ones(1, 3, 2, 2, dtype=torch.bool),
+        "depth_masks": torch.ones(1, 3, 2, 2, dtype=torch.bool),
+        "source_gs_masks": torch.ones(1, 3, 2, 2, dtype=torch.bool),
+        "camera_poses": gt_poses,
+        "norm_factors": torch.tensor([6.0]),
+    }
+
+    loss._compute_gs_loss(pred, gt)
+
+    torch.testing.assert_close(
+        fake_branch.camera_poses_c2w[:, :, 0, 3],
+        torch.tensor([[3.0]]),
+    )
