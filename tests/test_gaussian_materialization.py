@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from panovggt.render.gs_branch import GSBranch, materialize_gaussians
@@ -267,6 +269,44 @@ def test_materialize_2x2_subgrid_uses_subpatch_centers_and_color_bootstrap():
     c0 = 0.28209479177387814
     expected_dc = (torch.tensor(values) - 0.5) / c0
     torch.testing.assert_close(out["sh_dc"][0, 0, 0, 0, :, 0], expected_dc)
+
+
+def test_materialize_2x2_depth_footprint_keeps_scale_and_mask_order():
+    gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    depth = torch.zeros(1, 1, 4, 4, 1)
+    point_masks = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+
+    depth[..., 0:2, 0:2, 0] = 1.0
+    depth[..., 0:2, 2:4, 0] = 2.0
+    depth[..., 2:4, 0:2, 0] = 99.0
+    depth[..., 2:4, 2:4, 0] = 8.0
+    depth[..., 2, 0, 0] = 4.0
+    point_masks[..., 2:4, 0:2] = False
+    point_masks[..., 2, 0] = True
+    point_masks[..., 3, 2:4] = False
+
+    out = _make_branch(
+        scale_init_mode="depth_footprint",
+        min_valid_ratio=0.5,
+    ).materialize(
+        gs_params=gs_params,
+        world_points=world_points,
+        images=images,
+        depth=depth,
+        point_masks=point_masks,
+    )
+
+    angular = 2 * math.pi / 4
+    expected_scale = torch.tensor([1.0, 2.0, 4.0, 8.0]) * angular
+    expected_scale = expected_scale.view(1, 1, 1, 1, 4, 1).expand(1, 1, 1, 1, 4, 3)
+    expected_valid = torch.tensor([1.0, 1.0, 0.25, 0.5]).view(1, 1, 1, 1, 4, 1)
+    expected_opacity = torch.tensor([1.0, 1.0, 0.0, 1.0]).view(1, 1, 1, 1, 4, 1)
+
+    torch.testing.assert_close(out["scale_init"], expected_scale)
+    torch.testing.assert_close(out["patch_valid"], expected_valid)
+    torch.testing.assert_close(out["opacities"], expected_opacity)
 
 
 def test_aggregate_predictions_flattens_2x2_subgrid_gaussians():
