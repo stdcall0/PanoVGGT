@@ -9,8 +9,7 @@ Given:
 This module:
     1. Builds patch-level Gaussian centers from world_points (avg-pool).
     2. Constructs final GS parameter tensors (with stage gating).
-    3. Calls the configured renderer (cube or odgs) to render at all S
-       input-frame poses.
+    3. Calls the cube renderer to render at all S input-frame poses.
     4. Returns (rendered_rgb, rendered_depth, render_mask, gs_dict).
 """
 
@@ -111,21 +110,18 @@ class GSBranch:
             offset=use_offset,
         )
 
-        if renderer == "cube":
-            from .cube_renderer import CubePanoRenderer
-            self.renderer = CubePanoRenderer(
-                equ_h=equ_h,
-                face_res=face_res,
-                fov_deg=fov_deg,
-                boundary_px=boundary_px,
-                sh_degree=sh_degree,
-                bg_color=0.0,
-            )
-        elif renderer == "odgs":
-            from .odgs_renderer import ODGSPanoRenderer
-            self.renderer = ODGSPanoRenderer(equ_h=equ_h, sh_degree=sh_degree)
-        else:
-            raise ValueError(f"unknown renderer '{renderer}'")
+        if renderer != "cube":
+            raise ValueError("only the cube Gaussian renderer is supported")
+
+        from .cube_renderer import CubePanoRenderer
+        self.renderer = CubePanoRenderer(
+            equ_h=equ_h,
+            face_res=face_res,
+            fov_deg=fov_deg,
+            boundary_px=boundary_px,
+            sh_degree=sh_degree,
+            bg_color=0.0,
+        )
 
     # ---------------------------------------------------------------------
     def _gate(self, raw: torch.Tensor, init: torch.Tensor, name: str):

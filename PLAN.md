@@ -12,12 +12,12 @@
 | Topic | Choice |
 |------|--------|
 | Center density | **Patch-level** — one Gaussian per ViT patch (37×74 = 2 738 / frame) |
-| Renderer | **Cubemap via gsplat** as primary; native pano (ODGS rasterizer) as optional second backend behind a config switch |
+| Renderer | **Cubemap via gsplat**; the unsupported ODGS stub has been removed |
 | GT supervision views | All `S` input frames (auto-encoding RGB; depth optional) |
 | Center source | Predicted `world_points` (detached at A-C; offset+grad enabled at D) |
 | Render res schedule | Centers full-res; cube faces 256² (A/B) → 384² (C) → 512² (D) |
 | Cube seam handling | Wider FoV (95°) + 4-px boundary mask in loss |
-| Reference repos | Splatt3R, ODGS, OmniGS, TPGS cloned under `references/` |
+| Reference repos | Splatt3R, OmniGS, TPGS cloned under `references/` |
 | Hardware target | RTX 4070 12 GB for debugging; **H100** for full retraining |
 
 ---
@@ -128,11 +128,7 @@ For each input view `i` in `[0..S-1]`:
 
 Default λ_ssim = 0.2 (Splatt3R/3DGS standard).
 
-### 3.2 ODGS native pano path (optional)
-
-Switch: `gs.renderer = "cube" | "odgs"`. ODGS path requires building `references/ODGS/submodules/odgs-gaussian-rasterization` as an editable pip install — done lazily at first use; if build fails, fall back to cube. We only wire the call signature now; full enablement in Stage C+ as time permits.
-
-### 3.3 SSIM / depth losses
+### 3.2 SSIM / depth losses
 
 - Use `kornia.metrics.ssim` if available, else a small 11×11 SSIM impl.
 - Optional masked depth L1 (predicted-depth from rasterizer vs GT depth) controlled by `gs.depth_weight` (default 0).
@@ -213,7 +209,6 @@ panovggt/
     __init__.py                      (new)
     gs_utils.py                      (init helpers, kNN, depth footprint)
     cube_renderer.py                 (new — gsplat path)
-    odgs_renderer.py                 (new — ODGS path, lazy import)
     losses.py                        (SSIM + masked L1 + composite loss)
     cube_to_equi.py                  (thin wrapper around existing Cube2Equirec)
   utils/
@@ -248,8 +243,7 @@ PIPELINE.md                          (write at end)
 7. **Smoke test**: single-scene overfit, Stage A, batch=1, S=2, 256² faces. Verify rendered ERP changes from gray to scene colors within 50 iterations.
 8. **Stage B / C / D** integration tests (each runs ~200 iters on the 4070 against a saved Stanford2D3D mini-batch).
 9. **Inference export**: PLY round-trip in a viewer (e.g. SuperSplat) for visual sanity.
-10. **ODGS path** wiring (build attempted in CI; fall back if extension unavailable).
-11. Write `GUIDE.md` and `PIPELINE.md`.
+10. Write `GUIDE.md` and `PIPELINE.md`.
 
 ---
 
@@ -260,7 +254,6 @@ PIPELINE.md                          (write at end)
 | gsplat CUDA ext not installable on WSL | Ship pre-built wheel install instructions; cube renderer can also be exercised on CPU at tiny res for unit test |
 | Memory blow-up at S=4 full-res D | Activation checkpoint render loop; allow `face_res` schedule down |
 | Patch-pooling washes out high-freq depth | Acceptable for first loop; later we can subdivide each patch into 2×2 sub-Gaussians (planned Stage E, **out of scope**) |
-| ODGS extension build (gcc/CUDA mismatch) | Treat ODGS path as best-effort; cube remains canonical |
 | Cube seams visible | Already mitigated with FoV=95° + boundary mask. Soft fade can be added if visible artifacts persist |
 | Backbone collapse at Stage D | Lower backbone LR (1e-6) when unfrozen; keep `point_loss` & `depth_loss` weights at original values |
 
@@ -270,5 +263,5 @@ PIPELINE.md                          (write at end)
 
 - `python training/launch.py --config training/config/gs/stage_a.yaml --overfit-one` reduces RGB L1 below 0.05 within 200 iters on Stanford2D3D scene 1.
 - `python inference.py --image_folder ... --gs out.ply` produces a viewable PLY with the right axes.
-- Stage B and C runs do not crash on either renderer; train loss decreases monotonically (smoothed) over 1k iters.
+- Stage B and C runs do not crash on the cube renderer; train loss decreases monotonically (smoothed) over 1k iters.
 - All baseline (non-GS) training entrypoints still work (regression test on `training/config/default.yaml`).

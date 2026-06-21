@@ -14,13 +14,6 @@ conda activate panovggt
 pip install gsplat==1.5.3
 ```
 
-The optional native pano (ODGS) renderer requires building its CUDA
-extension; only do this if you set `loss.gs.renderer: odgs`:
-
-```bash
-pip install -e references/ODGS/submodules/odgs-gaussian-rasterization
-```
-
 ---
 
 ## 1. Training
@@ -86,19 +79,7 @@ python launch.py --config gs/stage_b \
     +checkpoint.resume_from=runs/gs_stage_a/checkpoints/last.pt
 ```
 
-### 1.6 Switching renderer
-
-The default renderer is the cubemap path via gsplat. To try the native
-pano (ODGS) path:
-
-```bash
-python launch.py --config gs/stage_a loss.gs.renderer=odgs
-```
-
-If the ODGS extension is not built, the loss raises
-`NotImplementedError`. Switch back with `loss.gs.renderer=cube`.
-
-### 1.7 Tuning common knobs
+### 1.6 Tuning common knobs
 
 Override loss weights or face resolution at the CLI:
 
@@ -200,7 +181,5 @@ training. Drop `face_res` or batch size on smaller GPUs.
   — your stage YAML is missing `# @package _global_` at the top.
 - **`AssertionError: enable_gaussian=True requires enable_global_points=True`**
   — set `model.enable_global_points: True` in the YAML.
-- **`NotImplementedError: ODGS rasterizer not built`** — set
-  `loss.gs.renderer: cube` or build the ODGS extension.
 - **`backgrounds` shape error from gsplat** — you're on a gsplat
   version older than 1.5.x. Upgrade with `pip install gsplat==1.5.3`.

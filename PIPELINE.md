@@ -172,10 +172,8 @@ stable.
   is differentiable and cheap.
 - The 95° FoV + boundary mask combo eliminates visible seam artifacts
   in practice (TPGS reports the same).
-- A native pano rasterizer (ODGS, OmniGS) avoids the cubemap detour but
-  requires building and maintaining a custom CUDA extension whose API
-  drifts. We keep `loss.gs.renderer: odgs` as an opt-in switch for
-  future experiments.
+- Native pano rasterizers avoid the cubemap detour, but the previous ODGS
+  stub was not implemented. The active code path is cube rendering only.
 
 ## 5. Inference path
 
@@ -204,7 +202,6 @@ panovggt/render/__init__.py                  (new)
 panovggt/render/gs_utils.py                  (new)
 panovggt/render/cube_to_equi.py              (new)
 panovggt/render/cube_renderer.py             (new)
-panovggt/render/odgs_renderer.py             (new, lazy)
 panovggt/render/losses.py                    (new)
 panovggt/render/gs_branch.py                 (new)
 panovggt/utils/gs_export.py                  (new)
@@ -219,15 +216,14 @@ training/config/gs/stage_d.yaml              (new)
 
 references/                                  (gitignored — design refs only)
   splatt3r/
-  ODGS/
   OmniGS/
   TPGS/
 ```
 
 ## 7. Limitations and follow-ups
 
-- ODGS path is wired but its renderer call is a stub — full enablement
-  is follow-up work after the cube path is validated end-to-end.
+- The active renderer is the cube path; native pano rasterizers would need
+  a fresh implementation rather than the removed ODGS stub.
 - Centers are detached at Stages A-C, so `point_loss` continues to
   drive the world_points head. At Stage D the GS render contributes
   its own gradient to centers; tune `loss.gs.point_loss_weight` if you
