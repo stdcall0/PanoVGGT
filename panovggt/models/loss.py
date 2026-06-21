@@ -1032,6 +1032,25 @@ class Loss(nn.Module):
         gt_norm_factor = gt.get("norm_factors", None)
         pred_norm_factor = pred.get("norm_factor", None)
 
+        def gt_to_pred_scale(device: torch.device, dtype: torch.dtype):
+            if pred_norm_factor is None:
+                return None
+            pred_scale = pred_norm_factor.detach().to(device=device, dtype=dtype)
+            if gt_norm_factor is not None:
+                gt_scale = gt_norm_factor.to(device=device, dtype=dtype)
+            else:
+                gt_scale = torch.ones_like(pred_scale)
+            return gt_scale / pred_scale
+
+        def gt_source_anchor_w2c():
+            if source_full_idx is None or source_full_idx.numel() == 0:
+                raise ValueError("missing GS source indices for GT geometry bootstrap.")
+            gt_camera_poses = gt["camera_poses"].to(
+                device=world_points.device, dtype=camera_poses.dtype
+            )
+            anchor_pose = gt_camera_poses.index_select(1, source_full_idx[:1])
+            return invert_homogeneous_matrix(anchor_pose)
+
         def gt_target_camera_poses(target_view_idx: torch.Tensor):
             pose_source = str(
                 self.gs_conf.get("bootstrap_geometry_source", "gt")
@@ -1050,18 +1069,38 @@ class Loss(nn.Module):
             anchor_w2c = invert_homogeneous_matrix(anchor_pose)
             target_c2w = select_views(gt_camera_poses, target_view_idx)
             rel = torch.matmul(anchor_w2c.float(), target_c2w.float()).to(camera_poses.dtype)
-            if pred_norm_factor is not None:
-                pred_scale = pred_norm_factor.detach().view(B, 1, 1).to(
-                    device=rel.device, dtype=rel.dtype
-                )
-                if gt_norm_factor is not None:
-                    gt_scale = gt_norm_factor.view(B, 1, 1).to(
-                        device=rel.device, dtype=rel.dtype
-                    )
-                    rel[..., :3, 3] *= gt_scale / pred_scale
-                else:
-                    rel[..., :3, 3] /= pred_scale
+            scale_ratio = gt_to_pred_scale(device=rel.device, dtype=rel.dtype)
+            if scale_ratio is not None:
+                rel[..., :3, 3] *= scale_ratio.view(B, 1, 1)
             return rel
+
+        def gt_source_geometry(source_view_idx: torch.Tensor):
+            if "global_points" not in gt or gt["global_points"] is None:
+                raise KeyError(
+                    "bootstrap_geometry_source=gt requires GT `world_points`/`global_points`."
+                )
+            source_points = select_views(gt["global_points"], source_view_idx).to(
+                device=world_points.device, dtype=world_points.dtype
+            )
+            anchor_w2c = gt_source_anchor_w2c()[:, 0]
+            source_points = transform_points_homogeneous(source_points, anchor_w2c)
+            scale_ratio = gt_to_pred_scale(
+                device=source_points.device, dtype=source_points.dtype
+            )
+            if scale_ratio is not None:
+                source_points = source_points * scale_ratio.view(B, 1, 1, 1, 1)
+
+            source_depth = select_views(gt.get("depths", None), source_view_idx)
+            if source_depth is not None:
+                source_depth = source_depth.to(
+                    device=world_points.device, dtype=world_points.dtype
+                )
+                if scale_ratio is not None:
+                    if source_depth.dim() == 5:
+                        source_depth = source_depth * scale_ratio.view(B, 1, 1, 1, 1)
+                    else:
+                        source_depth = source_depth * scale_ratio.view(B, 1, 1, 1)
+            return source_points, source_depth
 
         sh_dim = gs_params["sh_rest"].shape[-1]        # 3*sh_extra/3 = sh_extra
         # Recover sh_degree from rest dim (sh_extra = (deg+1)^2 - 1)
@@ -1121,8 +1160,17 @@ class Loss(nn.Module):
             target_depth_masks = canonical_mask(depth_masks, render_B)
             target_rgb_masks = canonical_mask(rgb_masks, render_B)
         else:
-            source_world_points = select_views(world_points, source_idx)
-            source_depth_pred = select_views(depth_pred, source_idx)
+            pose_source = str(
+                self.gs_conf.get("bootstrap_geometry_source", "gt")
+            ).lower()
+            use_gt_source_geometry = (
+                split_before_forward and pose_source in ("gt", "ground_truth")
+            )
+            if use_gt_source_geometry:
+                source_world_points, source_depth_pred = gt_source_geometry(source_full_idx)
+            else:
+                source_world_points = select_views(world_points, source_idx)
+                source_depth_pred = select_views(depth_pred, source_idx)
             source_images = select_views(images, source_idx)
             source_masks = select_views(source_gs_masks_for_pred, source_idx)
             source_gs_params = select_gs_params(gs_params, source_idx)
