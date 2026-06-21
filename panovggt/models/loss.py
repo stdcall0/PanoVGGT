@@ -1074,6 +1074,21 @@ class Loss(nn.Module):
                 rel[..., :3, 3] *= scale_ratio.view(B, 1, 1)
             return rel
 
+        def gt_source_camera_poses(source_view_idx: torch.Tensor):
+            if source_full_idx is None or source_full_idx.numel() == 0:
+                raise ValueError("missing GS source indices for source camera pose bootstrap.")
+            gt_camera_poses = gt["camera_poses"].to(
+                device=world_points.device, dtype=camera_poses.dtype
+            )
+            anchor_pose = gt_camera_poses.index_select(1, source_full_idx[:1])
+            anchor_w2c = invert_homogeneous_matrix(anchor_pose)
+            source_c2w = select_views(gt_camera_poses, source_view_idx)
+            rel = torch.matmul(anchor_w2c.float(), source_c2w.float()).to(camera_poses.dtype)
+            scale_ratio = gt_to_pred_scale(device=rel.device, dtype=rel.dtype)
+            if scale_ratio is not None:
+                rel[..., :3, 3] *= scale_ratio.view(B, 1, 1)
+            return rel
+
         def gt_source_geometry(source_view_idx: torch.Tensor):
             if "global_points" not in gt or gt["global_points"] is None:
                 raise KeyError(
@@ -1144,6 +1159,7 @@ class Loss(nn.Module):
                 images=flat_images,
                 depth=flat_depth_pred,
                 point_masks=flat_masks,
+                source_camera_poses_c2w=flat_camera_poses,
             )
 
             rgb_pred = out["rgb_erp"].reshape(render_B * render_T, 3, H, W)
@@ -1168,9 +1184,11 @@ class Loss(nn.Module):
             )
             if use_gt_source_geometry:
                 source_world_points, source_depth_pred = gt_source_geometry(source_full_idx)
+                source_camera_poses = gt_source_camera_poses(source_full_idx)
             else:
                 source_world_points = select_views(world_points, source_idx)
                 source_depth_pred = select_views(depth_pred, source_idx)
+                source_camera_poses = select_views(camera_poses, source_idx)
             source_images = select_views(images, source_idx)
             source_masks = select_views(source_gs_masks_for_pred, source_idx)
             source_gs_params = select_gs_params(gs_params, source_idx)
@@ -1198,6 +1216,7 @@ class Loss(nn.Module):
                 images=source_images,
                 depth=source_depth_pred,
                 point_masks=source_masks,
+                source_camera_poses_c2w=source_camera_poses,
             )
 
             rgb_pred = out["rgb_erp"].reshape(B * T, 3, H, W)

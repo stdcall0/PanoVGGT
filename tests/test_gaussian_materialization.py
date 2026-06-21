@@ -268,6 +268,29 @@ def test_tangent_rotation_init_aligns_local_z_to_center_ray():
     torch.testing.assert_close(out["rotations"].norm(dim=-1), torch.ones(1, 1, 2, 2))
 
 
+def test_tangent_rotation_init_uses_source_camera_center_when_provided():
+    from panovggt.utils.rotation import quat_to_mat
+
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    world_points[..., 0] = 1.0
+    world_points[..., 2] = 1.0
+    images = torch.zeros(1, 1, 3, 4, 4)
+    source_camera_poses = torch.eye(4).view(1, 1, 4, 4)
+    source_camera_poses[:, :, 0, 3] = 1.0
+    branch = _make_branch(rotation_init_mode="tangent")
+
+    out = branch.materialize(
+        gs_params,
+        world_points,
+        images,
+        source_camera_poses_c2w=source_camera_poses,
+    )
+    rot = quat_to_mat(out["rotations"])
+
+    torch.testing.assert_close(rot[..., :, 2], torch.tensor([0.0, 0.0, 1.0]).expand(1, 1, 2, 2, 3))
+
+
 def test_linear_gaussian_head_can_emit_2x2_subgrid_tensors():
     from panovggt.layers.gaussian_head import LinearGaussianHead
 

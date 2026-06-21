@@ -141,6 +141,7 @@ class GSBranch:
         images: torch.Tensor,                 # (B,S,3,H,W) GT
         depth: Optional[torch.Tensor] = None, # (B,S,H,W,1) predicted
         point_masks: Optional[torch.Tensor] = None, # (B,S,H,W) valid geometry mask
+        source_camera_poses_c2w: Optional[torch.Tensor] = None, # (B,S,4,4), for tangent init
     ) -> Dict[str, torch.Tensor]:
         B, S, H, W, _ = world_points.shape
         patch_size = H // gs_params["sh_dc"].shape[2]
@@ -265,7 +266,14 @@ class GSBranch:
 
         # rotation
         if self.rotation_init_mode == "tangent":
-            rotation_init = tangent_frame_quaternions(centers_pp.detach())
+            tangent_rays = centers_pp.detach()
+            if source_camera_poses_c2w is not None:
+                camera_centers = source_camera_poses_c2w.to(
+                    device=tangent_rays.device,
+                    dtype=tangent_rays.dtype,
+                )[..., :3, 3]
+                tangent_rays = tangent_rays - camera_centers.view(B, S, 1, 1, 1, 3)
+            rotation_init = tangent_frame_quaternions(tangent_rays)
         elif self.rotation_init_mode == "identity":
             rotation_init = gs_rotation.new_zeros(gs_rotation.shape)
             rotation_init[..., 0] = 1.0
@@ -331,6 +339,7 @@ class GSBranch:
         images: torch.Tensor,                 # (B,S,3,H,W) GT
         depth: Optional[torch.Tensor] = None, # (B,S,H,W,1) predicted
         point_masks: Optional[torch.Tensor] = None, # (B,S,H,W) valid geometry mask
+        source_camera_poses_c2w: Optional[torch.Tensor] = None, # (B,S,4,4), source frame for tangent init
     ):
         B = world_points.shape[0]
         materialized = self.materialize(
@@ -339,6 +348,7 @@ class GSBranch:
             images=images,
             depth=depth,
             point_masks=point_masks,
+            source_camera_poses_c2w=source_camera_poses_c2w,
         )
         centers = materialized["centers"]
         scale_final = materialized["scales"]

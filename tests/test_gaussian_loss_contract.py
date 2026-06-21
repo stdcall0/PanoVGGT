@@ -104,16 +104,31 @@ class _FakeBranch:
         self.renderer = _FakeRenderer()
         self.point_masks = None
         self.camera_poses_c2w = None
+        self.source_camera_poses_c2w = None
         self.world_points = None
         self.depth = None
         self.images = None
 
-    def render(self, gs_params, world_points, camera_poses_c2w, images, depth=None, point_masks=None):
+    def render(
+        self,
+        gs_params,
+        world_points,
+        camera_poses_c2w,
+        images,
+        depth=None,
+        point_masks=None,
+        source_camera_poses_c2w=None,
+    ):
         batch = world_points.shape[0]
         targets = camera_poses_c2w.shape[1]
         height, width = world_points.shape[2:4]
         self.point_masks = point_masks.detach().clone() if point_masks is not None else None
         self.camera_poses_c2w = camera_poses_c2w.detach().clone()
+        self.source_camera_poses_c2w = (
+            source_camera_poses_c2w.detach().clone()
+            if source_camera_poses_c2w is not None
+            else None
+        )
         self.world_points = world_points.detach().clone()
         self.depth = depth.detach().clone() if depth is not None else None
         self.images = images.detach().clone()
@@ -317,7 +332,7 @@ def test_trainer_side_novel_view_gt_bootstrap_uses_gt_source_geometry():
 
     gt_poses = _identity_poses(views=3)
     gt_poses[:, 1, 0, 3] = 10.0
-    gt_poses[:, 2, 0, 3] = 10.0
+    gt_poses[:, 2, 0, 3] = 13.0
     gt_points = torch.zeros(1, 3, 2, 2, 3)
     gt_points[:, 1, ..., 0] = 12.0
     gt_points[:, 2, ..., 0] = 14.0
@@ -353,3 +368,7 @@ def test_trainer_side_novel_view_gt_bootstrap_uses_gt_source_geometry():
         torch.tensor([[[[2.0, 2.0], [2.0, 2.0]], [[4.0, 4.0], [4.0, 4.0]]]]),
     )
     torch.testing.assert_close(fake_branch.depth, gt_depths[:, 1:3])
+    torch.testing.assert_close(
+        fake_branch.source_camera_poses_c2w[:, :, 0, 3],
+        torch.tensor([[0.0, 3.0]]),
+    )
