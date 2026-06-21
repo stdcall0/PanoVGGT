@@ -416,6 +416,7 @@ def materialize_gaussians(
     gs_conf: Dict,
     sh_degree: int,
     point_masks: Optional[torch.Tensor] = None,
+    source_camera_poses_c2w: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the exact Gaussian tensors used by GSBranch.render for export/tests."""
     branch = object.__new__(GSBranch)
@@ -447,4 +448,5 @@ def materialize_gaussians(
         images=images,
         depth=depth,
         point_masks=point_masks,
+        source_camera_poses_c2w=source_camera_poses_c2w,
     )

@@ -217,12 +217,13 @@ def depth_footprint_scale(
         pooled = depth_sum / valid_ratio.clamp_min(1e-6)
         pooled = torch.where(valid_ratio > 0, pooled, torch.zeros_like(pooled))
     else:
-        pooled = F.avg_pool2d(
-            depth.flatten(0, 1).unsqueeze(1),
-            kernel_size=patch_size,
-            stride=patch_size,
-        ).squeeze(1)  # (B*S, Hp, Wp)
-        pooled = pooled.view(*depth.shape[:2], *pooled.shape[-2:])
+        finite = torch.isfinite(depth)
+        valid = finite.to(dtype=depth.dtype)
+        safe_depth = torch.where(finite, depth, torch.zeros_like(depth))
+        depth_sum = _avg_pool_4d(safe_depth * valid, patch_size)
+        valid_ratio = _avg_pool_4d(valid, patch_size)
+        pooled = depth_sum / valid_ratio.clamp_min(1e-6)
+        pooled = torch.where(valid_ratio > 0, pooled, torch.zeros_like(pooled))
     if pooled.dim() == 3:
         pooled = pooled.view(*depth.shape[:2], *pooled.shape[-2:])
 
@@ -267,6 +268,13 @@ def knn_scale(centers: torch.Tensor, k: int = 3) -> torch.Tensor:
     B, S = orig_shape[:2]
     pts = centers.reshape(B, S, -1, 3)
     N = pts.shape[2]
+    if N < 2:
+        return torch.full(
+            (*orig_shape[:-1], 3),
+            1e-4,
+            device=centers.device,
+            dtype=centers.dtype,
+        )
     k = min(k, max(N - 1, 1))
     # pairwise distances per (B,S)
     d2 = torch.cdist(pts, pts, p=2)  # (B, S, N, N)

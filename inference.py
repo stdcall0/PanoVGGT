@@ -113,7 +113,7 @@ def normalize_gs_export_frame(
     local_points: torch.Tensor,
     camera_poses: torch.Tensor,
     depth: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """Match the normalized cam0 frame used by the GS render loss."""
     B, S, H, W, _ = world_points.shape
     if local_points.shape != world_points.shape:
@@ -135,16 +135,26 @@ def normalize_gs_export_frame(
 
     cam0_w2c = invert_homogeneous_matrix(camera_poses[:, :1])[:, 0]
     world_points_cam0 = transform_points_homogeneous(world_points, cam0_w2c) / scale
+    gs_camera_poses = torch.matmul(
+        cam0_w2c[:, None].float(),
+        camera_poses.float(),
+    ).to(dtype=camera_poses.dtype)
+    gs_camera_poses[..., :3, 3] /= norm_factor.view(B, 1, 1)
+    eye = torch.eye(4, device=gs_camera_poses.device, dtype=gs_camera_poses.dtype)
+    gs_camera_poses = torch.cat(
+        [eye.view(1, 1, 4, 4).expand(B, 1, 4, 4), gs_camera_poses[:, 1:]],
+        dim=1,
+    )
 
     if depth is None:
-        return world_points_cam0, None, norm_factor
+        return world_points_cam0, None, norm_factor, gs_camera_poses
     if depth.dim() == 5:
         depth = depth / scale
     elif depth.dim() == 4:
         depth = depth / norm_factor.view(B, 1, 1, 1)
     else:
         raise ValueError(f"unexpected tensor shape for depth: {tuple(depth.shape)}")
-    return world_points_cam0, depth, norm_factor
+    return world_points_cam0, depth, norm_factor, gs_camera_poses
 
 
 def load_gs_conf(config_path: str) -> dict:
@@ -688,7 +698,7 @@ def main(args: argparse.Namespace) -> None:
         point_masks_t = ensure_batched_mask_tensor(point_masks_t, "point_masks")
         if depth_t is not None:
             depth_t = ensure_batched_map_tensor(depth_t, "depth")
-        wp_t, depth_t, norm_factor = normalize_gs_export_frame(
+        wp_t, depth_t, norm_factor, gs_camera_poses_t = normalize_gs_export_frame(
             world_points=wp_t,
             local_points=local_t,
             camera_poses=poses_t,
@@ -712,6 +722,7 @@ def main(args: argparse.Namespace) -> None:
             "images": images_t,
             "depth": depth_t,
             "point_masks": point_masks_t,
+            "gs_camera_poses": gs_camera_poses_t,
         }
         agg = aggregate_predictions(
             wrap,

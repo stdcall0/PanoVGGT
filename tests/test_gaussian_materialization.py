@@ -7,7 +7,7 @@ from panovggt.render.gs_branch import (
     _smooth_bounded_scale_multiplier,
     materialize_gaussians,
 )
-from panovggt.render.gs_utils import depth_footprint_scale
+from panovggt.render.gs_utils import depth_footprint_scale, knn_scale
 
 
 def _make_branch(**overrides):
@@ -291,6 +291,31 @@ def test_tangent_rotation_init_uses_source_camera_center_when_provided():
     torch.testing.assert_close(rot[..., :, 2], torch.tensor([0.0, 0.0, 1.0]).expand(1, 1, 2, 2, 3))
 
 
+def test_free_materialize_uses_source_camera_center_for_tangent_rotation():
+    from panovggt.utils.rotation import quat_to_mat
+
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    world_points[..., 0] = 1.0
+    world_points[..., 2] = 1.0
+    images = torch.zeros(1, 1, 3, 4, 4)
+    source_camera_poses = torch.eye(4).view(1, 1, 4, 4)
+    source_camera_poses[:, :, 0, 3] = 1.0
+
+    out = materialize_gaussians(
+        gs_params=gs_params,
+        world_points=world_points,
+        images=images,
+        depth=None,
+        gs_conf={"rotation_init_mode": "tangent", "scale_init_mode": "constant"},
+        sh_degree=1,
+        source_camera_poses_c2w=source_camera_poses,
+    )
+    rot = quat_to_mat(out["rotations"])
+
+    torch.testing.assert_close(rot[..., :, 2], torch.tensor([0.0, 0.0, 1.0]).expand(1, 1, 2, 2, 3))
+
+
 def test_linear_gaussian_head_can_emit_2x2_subgrid_tensors():
     from panovggt.layers.gaussian_head import LinearGaussianHead
 
@@ -396,6 +421,24 @@ def test_depth_footprint_scale_shrinks_horizontal_axis_near_erp_poles():
     torch.testing.assert_close(scale[0, 0, 0, 0, 2], scale[0, 0, 1, 0, 2])
 
 
+def test_depth_footprint_scale_without_mask_ignores_nonfinite_depth():
+    depth = torch.ones(1, 1, 4, 4)
+    depth[..., 0, 0] = float("nan")
+
+    scale = depth_footprint_scale(depth, patch_size=2, H=4)
+
+    assert torch.isfinite(scale).all()
+    torch.testing.assert_close(scale[0, 0, 0, 0, 1], torch.tensor(math.pi / 2))
+
+
+def test_knn_scale_returns_finite_fallback_for_single_gaussian():
+    centers = torch.zeros(1, 1, 1, 3)
+
+    scale = knn_scale(centers)
+
+    torch.testing.assert_close(scale, torch.full_like(scale, 1e-4))
+
+
 def test_aggregate_predictions_flattens_2x2_subgrid_gaussians():
     from panovggt.utils.gs_export import aggregate_predictions
 
@@ -410,6 +453,33 @@ def test_aggregate_predictions_flattens_2x2_subgrid_gaussians():
     )
 
     assert agg["means"].shape == (4, 3)
+
+
+def test_aggregate_predictions_uses_camera_poses_for_tangent_export():
+    from panovggt.utils.rotation import quat_to_mat
+    from panovggt.utils.gs_export import aggregate_predictions
+
+    gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    world_points[..., 0] = 1.0
+    world_points[..., 2] = 1.0
+    images = torch.zeros(1, 1, 3, 4, 4)
+    camera_poses = torch.eye(4).view(1, 1, 4, 4)
+    camera_poses[:, :, 0, 3] = 1.0
+
+    agg = aggregate_predictions(
+        {
+            "gaussian": gs_params,
+            "world_points": world_points,
+            "images": images,
+            "camera_poses": camera_poses,
+        },
+        sh_degree=1,
+        gs_conf={"scale_init_mode": "constant", "rotation_init_mode": "tangent"},
+    )
+    rot = quat_to_mat(agg["rotations"])
+
+    torch.testing.assert_close(rot[..., :, 2], torch.tensor([0.0, 0.0, 1.0]).expand(4, 3))
 
 
 class _RecordingRenderer:
