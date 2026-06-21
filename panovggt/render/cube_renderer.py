@@ -229,14 +229,18 @@ class CubePanoRenderer(nn.Module):
             width=self.face_res,
             height=self.face_res,
             sh_degree=self.sh_degree,
-            render_mode="RGB+ED",
+            backgrounds=bg,
+            render_mode="RGB+D",
             packed=True,
         )
-        # rgb is (6V, H, W, 4)  (RGB + expected depth)
+        # rgb is (6V, H, W, 4)  (RGB + accumulated depth moment).
+        # Convert the moment to radial depth per face, project both moment and
+        # alpha to ERP, then divide in ERP space. This keeps cube interpolation
+        # alpha-weighted instead of interpolating per-face expected depths.
         rgb_d = rgb
         rgb_only = rgb_d[..., :3]              # (6V, H, W, 3)
-        depth = rgb_d[..., 3:4]                # (6V, H, W, 1)
-        depth = depth * self._face_ray_norm(device=device, dtype=dtype)
+        depth_moment = rgb_d[..., 3:4]         # (6V, H, W, 1)
+        depth_moment = depth_moment * self._face_ray_norm(device=device, dtype=dtype)
         alpha = alpha                          # (6V, H, W, 1)
 
         # reshape to (V, C, 6, face, face) for cube2equi
@@ -246,15 +250,20 @@ class CubePanoRenderer(nn.Module):
             return x.permute(0, 2, 1, 3, 4).contiguous()  # (V, C, 6, h, w)
 
         rgb_cube = _to_cube(rgb_only)
-        depth_cube = _to_cube(depth)
+        depth_moment_cube = _to_cube(depth_moment)
         alpha_cube = _to_cube(alpha)
 
         boundary = self._boundary_mask().to(device=device, dtype=dtype)     # (1,1,6,h,w)
         mask_cube = boundary.expand(V, 1, 6, self.face_res, self.face_res)  # (V,1,6,h,w)
 
         rgb_erp = self.cube2equi(rgb_cube)
-        depth_erp = self.cube2equi(depth_cube)
+        depth_moment_erp = self.cube2equi(depth_moment_cube)
         alpha_erp = self.cube2equi(alpha_cube)
+        depth_erp = torch.where(
+            alpha_erp > 1e-6,
+            depth_moment_erp / alpha_erp.clamp_min(1e-6),
+            torch.zeros_like(depth_moment_erp),
+        )
         mask_erp = self.cube2equi(mask_cube) * self.cube2equi.get_valid_mask(V).to(device=device, dtype=dtype)
 
         return dict(
