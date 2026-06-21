@@ -49,6 +49,38 @@ def test_gaussian_render_loss_supports_masked_charbonnier():
     torch.testing.assert_close(details["rgb_charbonnier"], expected)
 
 
+def test_gaussian_render_loss_ignores_nan_outside_rgb_and_depth_masks():
+    rgb_pred = torch.zeros(1, 3, 2, 2)
+    rgb_gt = torch.zeros_like(rgb_pred)
+    rgb_pred[:, :, 0, 1] = float("nan")
+    depth_pred = torch.zeros(1, 1, 2, 2)
+    depth_gt = torch.zeros_like(depth_pred)
+    depth_gt[:, :, 1, 0] = float("nan")
+    mask = torch.zeros(1, 1, 2, 2)
+    mask[:, :, 0, 0] = 1.0
+    depth_mask = torch.zeros(1, 1, 2, 2)
+    depth_mask[:, :, 1, 1] = 1.0
+
+    loss_fn = GaussianRenderLoss(
+        rgb_weight=1.0,
+        ssim_weight=0.0,
+        depth_weight=1.0,
+        rgb_loss_type="mse",
+    )
+    total, details = loss_fn(
+        rgb_pred,
+        rgb_gt,
+        mask=mask,
+        depth_pred=depth_pred,
+        depth_gt=depth_gt,
+        depth_mask=depth_mask,
+    )
+
+    torch.testing.assert_close(details["rgb_loss"], torch.tensor(0.0))
+    torch.testing.assert_close(details["depth_l1"], torch.tensor(0.0))
+    torch.testing.assert_close(total, torch.tensor(0.0))
+
+
 def test_gaussian_render_loss_ssim_requires_fully_valid_window():
     rgb_pred = torch.zeros(1, 3, 5, 5)
     rgb_gt = torch.zeros_like(rgb_pred)
@@ -56,6 +88,26 @@ def test_gaussian_render_loss_ssim_requires_fully_valid_window():
     rgb_pred[:, :, 2, 2] = 0.0
     mask = torch.zeros(1, 1, 5, 5)
     mask[:, :, 2, 2] = 1.0
+
+    loss_fn = GaussianRenderLoss(
+        rgb_weight=0.0,
+        ssim_weight=1.0,
+        depth_weight=0.0,
+        ssim_window=3,
+        rgb_loss_type="mse",
+    )
+    total, details = loss_fn(rgb_pred, rgb_gt, mask=mask)
+
+    torch.testing.assert_close(details["ssim"], torch.tensor(0.0))
+    torch.testing.assert_close(total, torch.tensor(0.0))
+
+
+def test_gaussian_render_loss_ssim_ignores_nan_outside_valid_windows():
+    rgb_pred = torch.zeros(1, 3, 5, 5)
+    rgb_gt = torch.zeros_like(rgb_pred)
+    rgb_pred[:, :, 0, 0] = float("nan")
+    mask = torch.zeros(1, 1, 5, 5)
+    mask[:, :, 1:4, 1:4] = 1.0
 
     loss_fn = GaussianRenderLoss(
         rgb_weight=0.0,
@@ -263,6 +315,50 @@ def test_gaussian_loss_regularizers_use_patch_valid_mask():
 
     torch.testing.assert_close(details["offset_reg"], torch.tensor(0.0))
     torch.testing.assert_close(details["scale_reg"], torch.tensor(0.0))
+
+
+def test_gaussian_front_floater_ignores_nan_outside_depth_mask():
+    loss = Loss(
+        train_conf=False,
+        gs={
+            "enabled": True,
+            "rgb_weight": 0.0,
+            "ssim_weight": 0.0,
+            "depth_weight": 0.0,
+            "front_floater_weight": 1.0,
+            "front_floater_depth_source": "gt",
+            "front_floater_margin": 0.0,
+            "point_loss_weight": 0.0,
+            "camera_loss_weight": 0.0,
+        },
+    )
+    fake_branch = _FakeBranch()
+    fake_branch.extra_out = {
+        "depth_erp": torch.tensor([[[[[0.0, float("nan")], [0.0, 0.0]]]]]),
+        "alpha_erp": torch.ones(1, 1, 1, 2, 2),
+        "mask_erp": torch.ones(1, 1, 1, 2, 2),
+    }
+    loss.gs_branch = fake_branch
+    loss.gs_loss = _CaptureRenderLoss()
+    pred = {
+        "gs_world_points": torch.zeros(1, 1, 2, 2, 3),
+        "gs_camera_poses": _identity_poses(),
+        "depth": torch.ones(1, 1, 2, 2, 1),
+        "gaussian": _minimal_gaussian_params(),
+        "images": torch.zeros(1, 1, 3, 2, 2),
+    }
+    depth_masks = torch.ones(1, 1, 2, 2, dtype=torch.bool)
+    depth_masks[:, :, 0, 1] = False
+    gt = {
+        "imgs": torch.zeros(1, 1, 3, 2, 2),
+        "depths": torch.zeros(1, 1, 2, 2),
+        "valid_masks": torch.ones(1, 1, 2, 2, dtype=torch.bool),
+        "depth_masks": depth_masks,
+    }
+
+    _, details = loss._compute_gs_loss(pred, gt)
+
+    torch.testing.assert_close(details["front_floater"], torch.tensor(0.0))
 
 
 def test_trainer_side_novel_view_split_uses_full_gt_target_only_as_target():

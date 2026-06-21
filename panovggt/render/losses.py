@@ -72,7 +72,7 @@ def _masked_weighted_mean(
         weight_mask = weight_mask * mask
     if weight is not None:
         weight_mask = weight_mask * weight
-    err = err * weight_mask
+    err = torch.where(weight_mask > 0, err * weight_mask, torch.zeros_like(err))
     return err.sum() / (weight_mask.sum() * err.shape[1] + eps)
 
 
@@ -186,7 +186,11 @@ class GaussianRenderLoss(nn.Module):
             ssim_map = ssim(rgb_pred, rgb_gt, window_size=self.ssim_window)
             if mask is not None:
                 ssim_mask = _ssim_valid_window_mask(mask, self.ssim_window)
-                ssim_map = ssim_map * ssim_mask
+                ssim_map = torch.where(
+                    ssim_mask > 0,
+                    ssim_map * ssim_mask,
+                    torch.zeros_like(ssim_map),
+                )
                 denom = ssim_mask.sum() * ssim_map.shape[1]
                 ssim_loss = torch.where(
                     denom > 1e-6,

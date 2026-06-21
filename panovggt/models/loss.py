@@ -1257,7 +1257,12 @@ class Loss(nn.Module):
         if self._gs_coverage_weight > 0.0:
             coverage_target = alpha_render.new_tensor(self._gs_coverage_target_alpha)
             coverage_err = F.relu(coverage_target - alpha_render).square()
-            coverage = (coverage_err * rgb_mask).sum() / (rgb_mask.sum() + 1e-6)
+            coverage_weighted = torch.where(
+                rgb_mask > 0,
+                coverage_err * rgb_mask,
+                torch.zeros_like(coverage_err),
+            )
+            coverage = coverage_weighted.sum() / (rgb_mask.sum() + 1e-6)
             gs_details["coverage"] = coverage
             gs_total = gs_total + self._gs_coverage_weight * coverage
             gs_details["total"] = gs_total
@@ -1271,7 +1276,12 @@ class Loss(nn.Module):
                 margin = depth_render.new_tensor(self._gs_front_floater_margin)
                 front_err = F.relu(surface_depth - depth_render - margin).square()
                 front_weight = alpha_render * depth_render_mask
-                front_floater = (front_err * front_weight).sum() / (front_weight.sum() + 1e-6)
+                front_weighted = torch.where(
+                    front_weight > 0,
+                    front_err * front_weight,
+                    torch.zeros_like(front_err),
+                )
+                front_floater = front_weighted.sum() / (front_weight.sum() + 1e-6)
                 gs_details["front_floater"] = front_floater
                 gs_total = gs_total + self._gs_front_floater_weight * front_floater
                 gs_details["total"] = gs_total
