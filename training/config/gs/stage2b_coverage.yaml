@@ -1,13 +1,13 @@
 # @package _global_
-# Stage 3: optional low-LR full GS-head finetune.
-# Use only after stage 2 plateaus and visual validation looks stable.
+# Stage 2b: coverage/anti-floater refinement after stage2 plateau.
+# Keep geometry predictors frozen; refine only GS color, opacity, scale, and offset.
 
 defaults:
   - /gs/local
   - _self_
 
-exp_name: gs_stage3_full_head
-max_epochs: 300
+exp_name: gs_stage2b_coverage
+max_epochs: 1000
 limit_train_batches: 300
 limit_val_batches: 50
 
@@ -16,19 +16,25 @@ loss:
     photometric_mode: source_recon
     self_recon: False
     rgb_loss_type: mse
-    ssim_weight: 0.003
-    depth_weight: 0.0002
-    scale_init_factor: 0.5
+    ssim_weight: 0.001
+    depth_weight: 0.0
+    scale_init_factor: 0.75
     scale_mult_min: 0.25
-    scale_mult_max: 1.25
-    scale_reg_weight: 0.02
-    scale_reg_target: 1.0
+    scale_mult_max: 1.5
+    scale_reg_weight: 0.0025
+    scale_reg_target: 1.2
+    coverage_weight: 0.006
+    coverage_target_alpha: 1.0
+    front_floater_weight: 0.00002
+    front_floater_margin: 0.03
+    front_floater_depth_source: pred
+    offset_reg_weight: 0.000001
     use_offset: True
     train_dc: True
     train_opacity: True
     train_scale: True
-    train_rotation: True
-    train_sh_rest: True
+    train_rotation: False
+    train_sh_rest: False
 
 optim:
   frozen_module_names:
@@ -40,26 +46,23 @@ optim:
     - global_points_decoder
     - global_point_head
     - pos_adapters
+    - gaussian_head.rotation
+    - gaussian_head.sh_rest
   optimizer:
     _target_: torch.optim.AdamW
-    lr: 1.5e-7
+    lr: 5e-7
     weight_decay: 0.0
   options:
     lr:
       - param_names:
           - module.gaussian_head.scale.*
+          - module.gaussian_head.offset.*
         scheduler:
           _target_: fvcore.common.param_scheduler.ConstantParamScheduler
           value: 1e-7
-      - param_names:
-          - module.gaussian_head.rotation.*
-          - module.gaussian_head.sh_rest.*
-        scheduler:
-          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-          value: 5e-8
       - scheduler:
           _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-          value: 1.5e-7
+          value: 5e-7
     weight_decay:
       - scheduler:
           _target_: fvcore.common.param_scheduler.ConstantParamScheduler
@@ -67,8 +70,8 @@ optim:
 
 checkpoint:
   save_dir: ./outputs/${exp_name}/ckpts
-  save_freq: 5
-  resume_checkpoint_path: ./outputs/gs_stage3_full_head/ckpts/checkpoint.pt
+  save_freq: 25
+  resume_checkpoint_path: ./outputs/gs_stage2_refine/ckpts/checkpoint.pt
   strict: False
 
 logging:

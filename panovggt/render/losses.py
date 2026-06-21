@@ -1,5 +1,5 @@
 """
-Photometric losses for the GS branch (RGB L1 + SSIM + optional depth L1).
+Photometric losses for the GS branch (RGB L1/MSE + SSIM + optional depth L1).
 
 We avoid pulling kornia in by using a small differentiable SSIM impl.
 """
@@ -62,8 +62,20 @@ def masked_l1(
     return err.sum() / (mask.sum() * pred.shape[1] + eps)
 
 
+def masked_mse(
+    pred: torch.Tensor, gt: torch.Tensor, mask: Optional[torch.Tensor] = None, eps: float = 1e-6
+) -> torch.Tensor:
+    err = (pred - gt).square()
+    if mask is None:
+        return err.mean()
+    if mask.dim() == err.dim() - 1:
+        mask = mask.unsqueeze(1)
+    err = err * mask
+    return err.sum() / (mask.sum() * pred.shape[1] + eps)
+
+
 class GaussianRenderLoss(nn.Module):
-    """RGB-L1 + SSIM + optional depth-L1, all masked by ERP validity mask."""
+    """RGB photometric loss + SSIM + optional depth-L1, masked by ERP validity mask."""
 
     def __init__(
         self,
@@ -71,12 +83,18 @@ class GaussianRenderLoss(nn.Module):
         ssim_weight: float = 0.2,
         depth_weight: float = 0.0,
         ssim_window: int = 11,
+        rgb_loss_type: str = "l1",
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
         self.ssim_weight = ssim_weight
         self.depth_weight = depth_weight
         self.ssim_window = ssim_window
+        self.rgb_loss_type = rgb_loss_type.lower()
+        if self.rgb_loss_type not in ("l1", "mse", "l2"):
+            raise ValueError(
+                f"Unsupported rgb_loss_type '{rgb_loss_type}'. Use 'l1' or 'mse'."
+            )
 
     def forward(
         self,
@@ -88,9 +106,14 @@ class GaussianRenderLoss(nn.Module):
         depth_mask: Optional[torch.Tensor] = None,
     ):
         details = {}
-        rgb_l1 = masked_l1(rgb_pred, rgb_gt, mask)
-        details["rgb_l1"] = rgb_l1
-        total = self.rgb_weight * rgb_l1
+        if self.rgb_loss_type == "l1":
+            rgb_loss = masked_l1(rgb_pred, rgb_gt, mask)
+            details["rgb_l1"] = rgb_loss
+        else:
+            rgb_loss = masked_mse(rgb_pred, rgb_gt, mask)
+            details["rgb_mse"] = rgb_loss
+        details["rgb_loss"] = rgb_loss
+        total = self.rgb_weight * rgb_loss
 
         if self.ssim_weight > 0:
             ssim_map = ssim(rgb_pred, rgb_gt, window_size=self.ssim_window)

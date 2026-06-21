@@ -7,12 +7,21 @@ defaults:
   - _self_
 
 exp_name: gs_stage2_refine
-max_epochs: 80
+max_epochs: 260
 limit_train_batches: 300
 limit_val_batches: 50
 
 loss:
   gs:
+    self_recon: False
+    rgb_loss_type: mse
+    ssim_weight: 0.001
+    depth_weight: 0.0
+    scale_init_factor: 0.5
+    scale_mult_min: 0.25
+    scale_mult_max: 1.25
+    scale_reg_weight: 0.005
+    scale_reg_target: 1.0
     use_offset: True
     train_dc: True
     train_opacity: True
@@ -38,6 +47,11 @@ optim:
     weight_decay: 0.0
   options:
     lr:
+      - param_names:
+          - module.gaussian_head.scale.*
+        scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 2e-7
       - scheduler:
           _target_: fvcore.common.param_scheduler.ConstantParamScheduler
           value: 1e-6
@@ -49,7 +63,7 @@ optim:
 checkpoint:
   save_dir: ./outputs/${exp_name}/ckpts
   save_freq: 5
-  resume_checkpoint_path: ./outputs/gs_stage1_bootstrap/ckpts/stage1_model_only.pt
+  resume_checkpoint_path: ./outputs/gs_stage2_refine/ckpts/checkpoint_epoch159_clean.pt
   strict: False
 
 logging:

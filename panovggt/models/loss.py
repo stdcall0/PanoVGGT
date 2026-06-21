@@ -604,6 +604,7 @@ class Loss(nn.Module):
                 rgb_weight=float(self.gs_conf.get("rgb_weight", 1.0)),
                 ssim_weight=float(self.gs_conf.get("ssim_weight", 0.2)),
                 depth_weight=float(self.gs_conf.get("depth_weight", 0.0)),
+                rgb_loss_type=str(self.gs_conf.get("rgb_loss_type", "l1")),
             )
         self._gs_loss_weight = float(self.gs_conf.get("loss_weight", 1.0))
         self._point_loss_weight = float(self.gs_conf.get("point_loss_weight", 1.0))
@@ -613,6 +614,16 @@ class Loss(nn.Module):
         self._gs_num_target_views = int(self.gs_conf.get("num_target_views", 1))
         self._gs_self_recon = bool(self.gs_conf.get("self_recon", False))
         self._gs_mask_rgb_by_valid = bool(self.gs_conf.get("mask_rgb_by_valid", True))
+        self._gs_scale_reg_weight = float(self.gs_conf.get("scale_reg_weight", 0.0))
+        self._gs_scale_reg_target = float(self.gs_conf.get("scale_reg_target", 1.0))
+        self._gs_coverage_weight = float(self.gs_conf.get("coverage_weight", 0.0))
+        self._gs_coverage_target_alpha = float(self.gs_conf.get("coverage_target_alpha", 1.0))
+        self._gs_front_floater_weight = float(self.gs_conf.get("front_floater_weight", 0.0))
+        self._gs_front_floater_margin = float(self.gs_conf.get("front_floater_margin", 0.03))
+        self._gs_front_floater_depth_source = str(
+            self.gs_conf.get("front_floater_depth_source", "pred")
+        ).lower()
+        self._gs_offset_reg_weight = float(self.gs_conf.get("offset_reg_weight", 0.0))
     
     def prepare_gt(self, gt: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
@@ -815,9 +826,13 @@ class Loss(nn.Module):
             'loss_global_point': as_tensor(point_details.get('global_pts_loss', zero)),
             # GS-branch loss components (zero when disabled)
             'loss_gs': as_tensor(gs_total),
-            'loss_gs_rgb': as_tensor(gs_details.get('rgb_l1', zero)),
+            'loss_gs_rgb': as_tensor(gs_details.get('rgb_loss', gs_details.get('rgb_l1', zero))),
             'loss_gs_ssim': as_tensor(gs_details.get('ssim', zero)),
             'loss_gs_depth': as_tensor(gs_details.get('depth_l1', zero)),
+            'loss_gs_scale_reg': as_tensor(gs_details.get('scale_reg', zero)),
+            'loss_gs_coverage': as_tensor(gs_details.get('coverage', zero)),
+            'loss_gs_front_floater': as_tensor(gs_details.get('front_floater', zero)),
+            'loss_gs_offset_reg': as_tensor(gs_details.get('offset_reg', zero)),
         }
 
         return loss_dict
@@ -835,6 +850,9 @@ class Loss(nn.Module):
             sh_degree=int(sh_degree),
             scale_init_mode=str(gs_conf.get("scale_init_mode", "depth_footprint")),
             scale_init_value=float(gs_conf.get("scale_init_value", 0.01)),
+            scale_init_factor=float(gs_conf.get("scale_init_factor", 1.0)),
+            scale_mult_min=gs_conf.get("scale_mult_min", None),
+            scale_mult_max=gs_conf.get("scale_mult_max", None),
             use_offset=bool(gs_conf.get("use_offset", False)),
             detach_centers=bool(gs_conf.get("detach_centers", True)),
             detach_camera=bool(gs_conf.get("detach_camera", True)),
@@ -993,6 +1011,7 @@ class Loss(nn.Module):
             # during the fragile bootstrap phase.
             render_B = B * S
             render_T = 1
+            T = S
             flat_world_points = flatten_views(world_points)
             flat_depth_pred = flatten_views(depth_pred)
             flat_images = flatten_views(images)
@@ -1017,6 +1036,9 @@ class Loss(nn.Module):
             )
             target_depths = canonical_depth(gt.get("depths", None), S)
             target_depths = apply_depth_normalization(target_depths, S)
+            pred_target_depths = canonical_depth(
+                depth_pred.detach() if depth_pred is not None else None, S
+            )
             target_masks = canonical_mask(valid_masks, render_B)
         else:
             source_world_points = select_views(world_points, source_idx)
@@ -1027,6 +1049,7 @@ class Loss(nn.Module):
             render_camera_poses = select_views(camera_poses, target_idx)
             target_images = select_views(images, target_idx)
             target_depths_raw = select_views(gt.get("depths", None), target_idx)
+            target_pred_depths_raw = select_views(depth_pred.detach(), target_idx) if depth_pred is not None else None
             target_masks_raw = select_views(valid_masks, target_idx)
             T = int(target_idx.numel())
 
@@ -1047,15 +1070,17 @@ class Loss(nn.Module):
             )
             target_depths = canonical_depth(target_depths_raw, T)
             target_depths = apply_depth_normalization(target_depths, T)
+            pred_target_depths = canonical_depth(target_pred_depths_raw, T)
             target_masks = canonical_mask(target_masks_raw, B * T)
 
+        alpha_render = out["alpha_erp"].reshape(B * T, 1, H, W).clamp(0.0, 1.0)
         if target_masks is not None:
             valid_render_mask = render_mask * target_masks
         else:
             valid_render_mask = render_mask
         rgb_mask = valid_render_mask if self._gs_mask_rgb_by_valid else render_mask
 
-        return self.gs_loss(
+        gs_total, gs_details = self.gs_loss(
             rgb_pred=rgb_pred,
             rgb_gt=rgb_gt,
             mask=rgb_mask,
@@ -1063,6 +1088,46 @@ class Loss(nn.Module):
             depth_gt=target_depths,
             depth_mask=valid_render_mask if target_depths is not None else None,
         )
+        if self._gs_coverage_weight > 0.0:
+            coverage_target = alpha_render.new_tensor(self._gs_coverage_target_alpha)
+            coverage_err = F.relu(coverage_target - alpha_render).square()
+            coverage = (coverage_err * valid_render_mask).sum() / (valid_render_mask.sum() + 1e-6)
+            gs_details["coverage"] = coverage
+            gs_total = gs_total + self._gs_coverage_weight * coverage
+            gs_details["total"] = gs_total
+
+        if self._gs_front_floater_weight > 0.0:
+            if self._gs_front_floater_depth_source == "gt" and target_depths is not None:
+                surface_depth = target_depths.detach()
+            else:
+                surface_depth = pred_target_depths.detach() if pred_target_depths is not None else None
+            if surface_depth is not None:
+                margin = depth_render.new_tensor(self._gs_front_floater_margin)
+                front_err = F.relu(surface_depth - depth_render - margin).square()
+                front_weight = alpha_render * valid_render_mask
+                front_floater = (front_err * front_weight).sum() / (front_weight.sum() + 1e-6)
+                gs_details["front_floater"] = front_floater
+                gs_total = gs_total + self._gs_front_floater_weight * front_floater
+                gs_details["total"] = gs_total
+
+        if self._gs_offset_reg_weight > 0.0:
+            offset = out.get("offset", None)
+            scale_init = out.get("scale_init", None)
+            if offset is not None and scale_init is not None:
+                scale_ref = scale_init.detach().norm(dim=-1).clamp(min=1e-6)
+                offset_reg = (offset.norm(dim=-1) / scale_ref).square().mean()
+                gs_details["offset_reg"] = offset_reg
+                gs_total = gs_total + self._gs_offset_reg_weight * offset_reg
+                gs_details["total"] = gs_total
+
+        if self._gs_scale_reg_weight > 0.0:
+            scale_mult = out.get("scale_mult", None)
+            if scale_mult is not None:
+                scale_reg = F.relu(scale_mult - self._gs_scale_reg_target).square().mean()
+                gs_details["scale_reg"] = scale_reg
+                gs_total = gs_total + self._gs_scale_reg_weight * scale_reg
+                gs_details["total"] = gs_total
+        return gs_total, gs_details
 
     def _select_gs_target_indices(self, num_views: int, device: torch.device) -> torch.Tensor:
         count = self._gs_num_target_views

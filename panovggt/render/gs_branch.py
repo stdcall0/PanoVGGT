@@ -35,6 +35,9 @@ class GSBranch:
         sh_degree: int = 1,
         scale_init_mode: str = "depth_footprint",   # or "knn" or "constant"
         scale_init_value: float = 0.01,
+        scale_init_factor: float = 1.0,
+        scale_mult_min: Optional[float] = None,
+        scale_mult_max: Optional[float] = None,
         use_offset: bool = False,
         detach_centers: bool = True,
         detach_camera: bool = True,
@@ -50,6 +53,9 @@ class GSBranch:
         self.sh_degree = sh_degree
         self.scale_init_mode = scale_init_mode
         self.scale_init_value = scale_init_value
+        self.scale_init_factor = float(scale_init_factor)
+        self.scale_mult_min = scale_mult_min
+        self.scale_mult_max = scale_mult_max
         self.use_offset = use_offset
         self.detach_centers = detach_centers
         self.detach_camera = detach_camera
@@ -113,8 +119,10 @@ class GSBranch:
             centers_pp = centers_pp.detach()
 
         if self.use_offset and self.train_flags["offset"]:
-            centers = centers_pp + gs_params["offset"]
+            offset = gs_params["offset"]
+            centers = centers_pp + offset
         else:
+            offset = torch.zeros_like(centers_pp)
             centers = centers_pp
 
         # ---- color init ---------------------------------------------------
@@ -141,13 +149,19 @@ class GSBranch:
             scale_init = knn_scale(centers_pp.detach(), k=3)
         else:
             scale_init = torch.full_like(gs_params["scale"], float(self.scale_init_value))
+        scale_init = scale_init * self.scale_init_factor
         # Keep the configured scale init as the geometric prior. The head's
         # softplus output is initialized to scale_init_value, so this starts at
         # scale_init and learns a positive multiplicative correction.
         if self.train_flags["scale"]:
-            scale_mult = gs_params["scale"] / max(float(self.scale_init_value), 1e-6)
+            scale_mult_raw = gs_params["scale"] / max(float(self.scale_init_value), 1e-6)
+            scale_mult = scale_mult_raw
+            if self.scale_mult_min is not None or self.scale_mult_max is not None:
+                scale_mult = scale_mult.clamp(min=self.scale_mult_min, max=self.scale_mult_max)
             scale_final = scale_init.detach() * scale_mult
         else:
+            scale_mult_raw = torch.ones_like(scale_init)
+            scale_mult = scale_mult_raw
             scale_final = scale_init.detach()
 
         # rotation
@@ -183,7 +197,11 @@ class GSBranch:
 
         return dict(
             centers=centers,
+            offset=offset,
             scales=scale_final,
+            scale_init=scale_init,
+            scale_mult=scale_mult_raw,
+            scale_mult_clamped=scale_mult,
             rotations=rotation_final,
             opacities=opacity_final,
             patch_valid=patch_valid,
@@ -213,6 +231,10 @@ class GSBranch:
         )
         centers = materialized["centers"]
         scale_final = materialized["scales"]
+        scale_init = materialized["scale_init"]
+        scale_mult_raw = materialized["scale_mult"]
+        scale_mult = materialized["scale_mult_clamped"]
+        offset = materialized["offset"]
         rotation_final = materialized["rotations"]
         opacity_final = materialized["opacities"]
         colors_sh = materialized["colors_sh"]
@@ -252,7 +274,11 @@ class GSBranch:
             alpha_erp=torch.stack(out_alpha, dim=0),
             mask_erp=torch.stack(out_mask, dim=0),
             centers=centers,
+            offset=offset,
             scales=scale_final,
+            scale_init=scale_init,
+            scale_mult=scale_mult_raw,
+            scale_mult_clamped=scale_mult,
             rotations=rotation_final,
             opacities=opacity_final,
             colors_sh=colors_sh,
@@ -274,6 +300,9 @@ def materialize_gaussians(
     branch.sh_degree = int(sh_degree)
     branch.scale_init_mode = str(gs_conf.get("scale_init_mode", "depth_footprint"))
     branch.scale_init_value = float(gs_conf.get("scale_init_value", 0.01))
+    branch.scale_init_factor = float(gs_conf.get("scale_init_factor", 1.0))
+    branch.scale_mult_min = gs_conf.get("scale_mult_min", None)
+    branch.scale_mult_max = gs_conf.get("scale_mult_max", None)
     branch.use_offset = bool(gs_conf.get("use_offset", False))
     branch.detach_centers = bool(gs_conf.get("detach_centers", True))
     branch.detach_camera = bool(gs_conf.get("detach_camera", True))

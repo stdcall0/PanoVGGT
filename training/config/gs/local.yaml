@@ -110,6 +110,10 @@ logging:
         - loss_gs_rgb
         - loss_gs_ssim
         - loss_gs_depth
+        - loss_gs_scale_reg
+        - loss_gs_coverage
+        - loss_gs_front_floater
+        - loss_gs_offset_reg
     val:
       keys_to_log:
         - loss_objective
@@ -117,6 +121,10 @@ logging:
         - loss_gs_rgb
         - loss_gs_ssim
         - loss_gs_depth
+        - loss_gs_scale_reg
+        - loss_gs_coverage
+        - loss_gs_front_floater
+        - loss_gs_offset_reg
 
 data:
   train:

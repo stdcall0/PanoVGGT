@@ -193,7 +193,7 @@ class Matterport3DDataset(BaseDataset):
 
     def _resolve_color_path(self, scene_path, view_name):
         """Return the preferred existing Matterport panorama RGB path for a view."""
-        for dirname in ('pano_skybox_color_fixed', 'pano_skybox_color', 'pano_color'):
+        for dirname in ('pano_color_perspective', 'pano_skybox_color_fixed', 'pano_skybox_color', 'pano_color'):
             color_dir = osp.join(scene_path, dirname)
             for ext in ('png', 'jpg'):
                 path = osp.join(color_dir, f"{view_name}.{ext}")
