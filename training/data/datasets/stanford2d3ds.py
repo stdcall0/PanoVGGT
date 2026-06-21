@@ -43,6 +43,8 @@ class Stanford2D3DSDataset(BaseDataset):
             test_areas: list = None,
             test_final_areas: list = None,
             get_nearby: bool = None,
+            mask_pano_poles: bool = True,
+            pano_pole_mask_ratio: float = 0.14,
     ):
         super().__init__(common_conf=common_conf)
 
@@ -62,6 +64,10 @@ class Stanford2D3DSDataset(BaseDataset):
         self.min_num_images = min_num_images
         self.augmentation = augmentation if augmentation is not None else common_conf.augs
         self.split = split
+        self.mask_pano_poles = bool(mask_pano_poles)
+        self.pano_pole_mask_ratio = float(pano_pole_mask_ratio)
+        if not 0.0 <= self.pano_pole_mask_ratio < 0.5:
+            raise ValueError("pano_pole_mask_ratio must be in [0, 0.5).")
 
         if train_areas is None:
             train_areas = ['area_1', 'area_2', 'area_3', 'area_4', 'area_6']
@@ -217,6 +223,23 @@ class Stanford2D3DSDataset(BaseDataset):
             self._equi_cache[equ_h] = rot
         return rot
 
+    def _apply_pano_pole_mask(self, frame_data):
+        if not self.mask_pano_poles:
+            return frame_data
+
+        valid_mask = frame_data['valid_mask']
+        h = valid_mask.shape[0]
+        pole_rows = int(round(h * self.pano_pole_mask_ratio))
+        pole_rows = min(pole_rows, h // 2)
+        if pole_rows <= 0:
+            return frame_data
+
+        pole_mask = torch.ones_like(valid_mask, dtype=torch.bool)
+        pole_mask[:pole_rows, :] = False
+        pole_mask[-pole_rows:, :] = False
+        frame_data['valid_mask'] = valid_mask & pole_mask
+        return frame_data
+
     def get_data(
             self,
             seq_index: int = None,
@@ -335,6 +358,7 @@ class Stanford2D3DSDataset(BaseDataset):
                     R_delta=R_delta,             # consumed in BaseDataset.process_one_image
                     depth_max=self.depth_max
                 )
+                self._apply_pano_pole_mask(frame_data)
 
                 if int(frame_data['valid_mask'].sum().item()) < 1024:
                     logging.warning("Skipping frame with too few valid depth pixels")

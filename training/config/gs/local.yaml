@@ -146,6 +146,8 @@ data:
           Stanford2D3DS_DIR: ../dataset/Stanford2D3DS
           len_train: 2400
           get_nearby: False
+          mask_pano_poles: true
+          pano_pole_mask_ratio: 0.14
         - _target_: data.datasets.structured3d.Structured3DDataset
           split: train
           Structured3D_DIR: ../dataset/Structured3D/Structured3D
@@ -174,6 +176,8 @@ data:
           split: test
           Stanford2D3DS_DIR: ../dataset/Stanford2D3DS
           len_test: 240
+          mask_pano_poles: true
+          pano_pole_mask_ratio: 0.14
         - _target_: data.datasets.structured3d.Structured3DDataset
           split: test
           Structured3D_DIR: ../dataset/Structured3D/Structured3D

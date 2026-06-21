@@ -35,6 +35,8 @@ data:
           Stanford2D3DS_DIR: /public/home/shiyj2-group/yijing/panorama/2d3ds/no_xyz
           len_train: 2400
           get_nearby: False
+          mask_pano_poles: true
+          pano_pole_mask_ratio: 0.14
         - _target_: data.datasets.matterport3d.Matterport3DDataset
           split: train
           Matterport3D_DIR: /public/home/shiyj2-group/yijing/panorama/matterport3D
@@ -65,6 +67,8 @@ data:
           split: test
           Stanford2D3DS_DIR: /public/home/shiyj2-group/yijing/panorama/2d3ds/no_xyz
           len_test: 240
+          mask_pano_poles: true
+          pano_pole_mask_ratio: 0.14
         - _target_: data.datasets.matterport3d.Matterport3DDataset
           split: test
           Matterport3D_DIR: /public/home/shiyj2-group/yijing/panorama/matterport3D
