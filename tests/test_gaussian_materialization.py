@@ -7,6 +7,7 @@ from panovggt.render.gs_branch import (
     _smooth_bounded_scale_multiplier,
     materialize_gaussians,
 )
+from panovggt.render.gs_utils import depth_footprint_scale
 
 
 def _make_branch(**overrides):
@@ -296,6 +297,32 @@ def test_materialize_2x2_subgrid_uses_subpatch_centers_and_color_bootstrap():
     torch.testing.assert_close(out["sh_dc"][0, 0, 0, 0, :, 0], expected_dc)
 
 
+def test_materialize_2x2_subgrid_pools_centers_and_dc_over_valid_pixels_only():
+    gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    point_masks = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+
+    world_points[..., 0:2, 0:2, 0] = 100.0
+    world_points[..., 0, 0, 0] = 10.0
+    images[..., 0:2, 0:2] = 0.9
+    images[..., 0, 0] = 0.2
+    point_masks[..., 0:2, 0:2] = False
+    point_masks[..., 0, 0] = True
+
+    out = _make_branch().materialize(
+        gs_params=gs_params,
+        world_points=world_points,
+        images=images,
+        point_masks=point_masks,
+    )
+
+    c0 = 0.28209479177387814
+    torch.testing.assert_close(out["centers"][0, 0, 0, 0, 0], torch.tensor([10.0, 0.0, 0.0]))
+    torch.testing.assert_close(out["sh_dc"][0, 0, 0, 0, 0], torch.full((3,), (0.2 - 0.5) / c0))
+    torch.testing.assert_close(out["patch_valid"][0, 0, 0, 0, 0], torch.tensor([0.25]))
+
+
 def test_materialize_2x2_depth_footprint_keeps_scale_and_mask_order():
     gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
     world_points = torch.zeros(1, 1, 4, 4, 3)
@@ -305,7 +332,7 @@ def test_materialize_2x2_depth_footprint_keeps_scale_and_mask_order():
 
     depth[..., 0:2, 0:2, 0] = 1.0
     depth[..., 0:2, 2:4, 0] = 2.0
-    depth[..., 2:4, 0:2, 0] = 99.0
+    depth[..., 2:4, 0:2, 0] = float("nan")
     depth[..., 2:4, 2:4, 0] = 8.0
     depth[..., 2, 0, 0] = 4.0
     point_masks[..., 2:4, 0:2] = False
@@ -324,14 +351,26 @@ def test_materialize_2x2_depth_footprint_keeps_scale_and_mask_order():
     )
 
     angular = 2 * math.pi / 4
-    expected_scale = torch.tensor([1.0, 2.0, 4.0, 8.0]) * angular
-    expected_scale = expected_scale.view(1, 1, 1, 1, 4, 1).expand(1, 1, 1, 1, 4, 3)
+    vertical = torch.tensor([1.0, 2.0, 4.0, 8.0]) * angular
+    horizontal = vertical * math.cos(math.pi / 4)
+    expected_scale = torch.stack([horizontal, vertical, vertical], dim=-1).view(1, 1, 1, 1, 4, 3)
     expected_valid = torch.tensor([1.0, 1.0, 0.25, 0.5]).view(1, 1, 1, 1, 4, 1)
     expected_opacity = torch.tensor([1.0, 1.0, 0.0, 1.0]).view(1, 1, 1, 1, 4, 1)
 
     torch.testing.assert_close(out["scale_init"], expected_scale)
     torch.testing.assert_close(out["patch_valid"], expected_valid)
     torch.testing.assert_close(out["opacities"], expected_opacity)
+
+
+def test_depth_footprint_scale_shrinks_horizontal_axis_near_erp_poles():
+    depth = torch.ones(1, 1, 8, 16)
+
+    scale = depth_footprint_scale(depth, patch_size=2, H=8)
+
+    assert scale.shape == (1, 1, 4, 8, 3)
+    assert scale[0, 0, 0, 0, 0] < scale[0, 0, 1, 0, 0]
+    torch.testing.assert_close(scale[0, 0, 0, 0, 1], scale[0, 0, 1, 0, 1])
+    torch.testing.assert_close(scale[0, 0, 0, 0, 2], scale[0, 0, 1, 0, 2])
 
 
 def test_aggregate_predictions_flattens_2x2_subgrid_gaussians():

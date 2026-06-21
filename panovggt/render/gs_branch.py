@@ -22,11 +22,13 @@ from panovggt.utils.geometry import se3_inverse
 from .gs_geometry import normalize_quaternion, quat_multiply, tangent_frame_quaternions
 from .gs_utils import (
     patch_pool,
+    patch_weighted_pool,
     patch_valid_ratio,
     depth_footprint_scale,
     knn_scale,
     subpatch_depth_footprint_scale,
     subpatch_pool,
+    subpatch_weighted_pool,
     subpatch_valid_ratio,
 )
 
@@ -177,18 +179,34 @@ class GSBranch:
                 patch_valid = patch_valid_ratio(point_masks, patch_size).unsqueeze(-1).unsqueeze(4)
 
         if has_subgrid:
-            centers_pp = subpatch_pool(world_points, patch_size, subgrid_size)
+            centers_pp = (
+                subpatch_weighted_pool(world_points, point_masks, patch_size, subgrid_size)
+                if point_masks is not None
+                else subpatch_pool(world_points, patch_size, subgrid_size)
+            )
         else:
-            centers_pp = patch_pool(world_points, patch_size).unsqueeze(4)
+            centers_pp = (
+                patch_weighted_pool(world_points, point_masks, patch_size)
+                if point_masks is not None
+                else patch_pool(world_points, patch_size)
+            ).unsqueeze(4)
         if self.detach_centers:
             centers_pp = centers_pp.detach()
 
         # ---- color init ---------------------------------------------------
         # patch-pool the GT image to get a per-Gaussian DC bootstrap.
         if has_subgrid:
-            img_pp = subpatch_pool(images, patch_size, subgrid_size)
+            img_pp = (
+                subpatch_weighted_pool(images, point_masks, patch_size, subgrid_size)
+                if point_masks is not None
+                else subpatch_pool(images, patch_size, subgrid_size)
+            )
         else:
-            img_pp = patch_pool(images, patch_size)
+            img_pp = (
+                patch_weighted_pool(images, point_masks, patch_size)
+                if point_masks is not None
+                else patch_pool(images, patch_size)
+            )
             img_pp = img_pp.permute(0, 1, 3, 4, 2).contiguous().unsqueeze(4)
         # gsplat with sh_degree expects DC stored as (rgb-0.5)/C0; we use the
         # PixelSplat convention where the coefficient lives at K=0.

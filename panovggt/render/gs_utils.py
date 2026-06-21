@@ -47,8 +47,7 @@ def patch_pool(x: torch.Tensor, patch_size: int) -> torch.Tensor:
         return x.reshape(B, S, C, Hp, Wp).contiguous()
 
 
-def patch_valid_ratio(mask: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """Average-pool a boolean/float valid mask to per-patch valid ratios."""
+def _mask_to_4d(mask: torch.Tensor) -> torch.Tensor:
     if mask.dim() == 5:
         if mask.shape[-1] == 1:
             mask = mask[..., 0]
@@ -58,6 +57,65 @@ def patch_valid_ratio(mask: torch.Tensor, patch_size: int) -> torch.Tensor:
             raise ValueError(f"unexpected 5-D mask shape {mask.shape}")
     if mask.dim() != 4:
         raise ValueError(f"expected mask shape (B,S,H,W), got {mask.shape}")
+    return mask
+
+
+def _avg_pool_4d(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    pooled = F.avg_pool2d(
+        x.flatten(0, 1).unsqueeze(1),
+        kernel_size=patch_size,
+        stride=patch_size,
+    ).squeeze(1)
+    return pooled.view(*x.shape[:2], *pooled.shape[-2:])
+
+
+def patch_weighted_pool(x: torch.Tensor, valid_mask: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """
+    Average-pool a per-pixel map using only valid pixels.
+
+    Invalid pixels are zeroed with `torch.where` before multiplication so NaN or
+    Inf values outside the mask cannot leak into the pooled result.
+    """
+    if x.dim() != 5:
+        raise ValueError(f"expected 5-D tensor, got {x.shape}")
+    valid = _mask_to_4d(valid_mask).to(dtype=x.dtype, device=x.device)
+    valid = valid * torch.isfinite(valid).to(dtype=x.dtype)
+
+    if x.shape[-1] in (1, 3) and x.shape[-3] != x.shape[-1]:
+        B, S, H, W, C = x.shape
+        weights = valid.unsqueeze(-1)
+        safe_x = torch.where(weights > 0, x, torch.zeros_like(x))
+        weighted = (safe_x * weights).permute(0, 1, 4, 2, 3).reshape(B * S, C, H, W)
+        numer = F.avg_pool2d(weighted, kernel_size=patch_size, stride=patch_size)
+        denom = F.avg_pool2d(
+            valid.flatten(0, 1).unsqueeze(1),
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        pooled = numer / denom.clamp_min(1e-6)
+        pooled = torch.where(denom > 0, pooled, torch.zeros_like(pooled))
+        Hp, Wp = pooled.shape[-2:]
+        return pooled.reshape(B, S, C, Hp, Wp).permute(0, 1, 3, 4, 2).contiguous()
+
+    B, S, C, H, W = x.shape
+    weights = valid.unsqueeze(2)
+    safe_x = torch.where(weights > 0, x, torch.zeros_like(x))
+    weighted = (safe_x * weights).reshape(B * S, C, H, W)
+    numer = F.avg_pool2d(weighted, kernel_size=patch_size, stride=patch_size)
+    denom = F.avg_pool2d(
+        valid.flatten(0, 1).unsqueeze(1),
+        kernel_size=patch_size,
+        stride=patch_size,
+    )
+    pooled = numer / denom.clamp_min(1e-6)
+    pooled = torch.where(denom > 0, pooled, torch.zeros_like(pooled))
+    Hp, Wp = pooled.shape[-2:]
+    return pooled.reshape(B, S, C, Hp, Wp).contiguous()
+
+
+def patch_valid_ratio(mask: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Average-pool a boolean/float valid mask to per-patch valid ratios."""
+    mask = _mask_to_4d(mask)
     pooled = F.avg_pool2d(
         mask.float().flatten(0, 1).unsqueeze(1),
         kernel_size=patch_size,
@@ -98,6 +156,23 @@ def subpatch_pool(x: torch.Tensor, patch_size: int, subgrid_size: int) -> torch.
     return _reshape_subgrid_pooled(pooled, subgrid_size, channel_last=channel_last)
 
 
+def subpatch_weighted_pool(
+    x: torch.Tensor,
+    valid_mask: torch.Tensor,
+    patch_size: int,
+    subgrid_size: int,
+) -> torch.Tensor:
+    """Valid-weighted pool into a per-patch subgrid with Q = subgrid_size^2."""
+    if patch_size % subgrid_size != 0:
+        raise ValueError(
+            f"patch_size={patch_size} must be divisible by subgrid_size={subgrid_size}."
+        )
+    subpatch_size = patch_size // subgrid_size
+    pooled = patch_weighted_pool(x, valid_mask, subpatch_size)
+    channel_last = pooled.shape[-1] in (1, 3) and pooled.shape[-3] != pooled.shape[-1]
+    return _reshape_subgrid_pooled(pooled, subgrid_size, channel_last=channel_last)
+
+
 def subpatch_valid_ratio(mask: torch.Tensor, patch_size: int, subgrid_size: int) -> torch.Tensor:
     if patch_size % subgrid_size != 0:
         raise ValueError(
@@ -115,42 +190,30 @@ def depth_footprint_scale(
     valid_mask=None,
 ) -> torch.Tensor:
     """
-    Compute an isotropic init scale per patch from depth and angular pixel size.
+    Compute a tangent-footprint init scale per patch from depth and ERP latitude.
 
     For an ERP image of height H, one row spans pi / H radians. A 14-pixel
     patch therefore subtends `patch_size * pi / H`. Multiplied by depth this
-    gives a tangent-plane footprint in world units. We pool depth to patch
-    resolution first.
+    gives a vertical tangent-plane footprint in world units. Horizontal ERP
+    footprint shrinks by cos(latitude), so the local x scale is row-aware.
 
     Args:
         depth: (B, S, H, W) or (B, S, H, W, 1).
         patch_size: int.
         H: ERP height in pixels.
     Returns:
-        Tensor (B, S, Hp, Wp, 3) of isotropic scales.
+        Tensor (B, S, Hp, Wp, 3) of local x/y/z scales.
     """
     if depth.dim() == 5:
         depth = depth.squeeze(-1)
     angular = patch_size * math.pi / float(H)
     if valid_mask is not None:
-        if valid_mask.dim() == 5:
-            if valid_mask.shape[-1] == 1:
-                valid_mask = valid_mask[..., 0]
-            elif valid_mask.shape[2] == 1:
-                valid_mask = valid_mask[:, :, 0]
-            else:
-                raise ValueError(f"unexpected 5-D valid_mask shape {valid_mask.shape}")
-        valid = valid_mask.to(dtype=depth.dtype)
-        depth_sum = F.avg_pool2d(
-            (depth * valid).flatten(0, 1).unsqueeze(1),
-            kernel_size=patch_size,
-            stride=patch_size,
-        ).squeeze(1)
-        valid_ratio = F.avg_pool2d(
-            valid.flatten(0, 1).unsqueeze(1),
-            kernel_size=patch_size,
-            stride=patch_size,
-        ).squeeze(1)
+        valid = _mask_to_4d(valid_mask).to(dtype=depth.dtype, device=depth.device)
+        finite = torch.isfinite(depth)
+        valid = valid * finite.to(dtype=depth.dtype)
+        safe_depth = torch.where(finite & (valid > 0), depth, torch.zeros_like(depth))
+        depth_sum = _avg_pool_4d(safe_depth * valid, patch_size)
+        valid_ratio = _avg_pool_4d(valid, patch_size)
         pooled = depth_sum / valid_ratio.clamp_min(1e-6)
         pooled = torch.where(valid_ratio > 0, pooled, torch.zeros_like(pooled))
     else:
@@ -159,9 +222,17 @@ def depth_footprint_scale(
             kernel_size=patch_size,
             stride=patch_size,
         ).squeeze(1)  # (B*S, Hp, Wp)
-    s = (pooled * angular).clamp_min(1e-4)
-    s = s.view(*depth.shape[:2], *s.shape[-2:])  # (B,S,Hp,Wp)
-    return s.unsqueeze(-1).expand(*s.shape, 3).contiguous()
+        pooled = pooled.view(*depth.shape[:2], *pooled.shape[-2:])
+    if pooled.dim() == 3:
+        pooled = pooled.view(*depth.shape[:2], *pooled.shape[-2:])
+
+    vertical = (pooled * angular).clamp_min(1e-4)
+    Hp = vertical.shape[-2]
+    row_centers = (torch.arange(Hp, device=depth.device, dtype=depth.dtype) + 0.5) * patch_size
+    latitude = (row_centers / float(H) - 0.5) * math.pi
+    cos_lat = torch.cos(latitude).abs().view(1, 1, Hp, 1)
+    horizontal = (vertical * cos_lat).clamp_min(1e-4)
+    return torch.stack([horizontal, vertical, vertical], dim=-1).contiguous()
 
 
 def subpatch_depth_footprint_scale(
