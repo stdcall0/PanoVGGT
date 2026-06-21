@@ -38,6 +38,8 @@ Advance when these tests pass on CPU-sized synthetic tensors and one real sample
 
 Purpose: give the head stable opacity and DC color before learning geometry.
 
+Config: `training/config/gs/stage1_bootstrap.yaml`.
+
 Trainable parameters: `sh_dc`, `opacity`.
 
 Frozen parameters: `offset`, `scale`, `rotation`, `sh_rest`, backbone.
@@ -53,6 +55,8 @@ Expected signs:
 ## Stage 2: Bounded Geometry Refinement
 
 Purpose: let the head sharpen using local offsets and scales without exploding.
+
+Config: `training/config/gs/stage2_refine.yaml`.
 
 Trainable parameters: `sh_dc`, `opacity`, bounded `scale`, bounded `offset`.
 
@@ -71,6 +75,8 @@ from their bounds.
 
 Purpose: improve holes and front floaters after Stage 2 plateaus.
 
+Config: `training/config/gs/stage2b_coverage.yaml`.
+
 Trainable parameters: same as Stage 2.
 
 Loss changes:
@@ -87,15 +93,17 @@ just to paint holes.
 Purpose: make the head learn source-to-target rendering instead of only source
 reconstruction.
 
+Config: `training/config/gs/stage2c_novel_view.yaml`.
+
 Trainable parameters: same as Stage 2, optionally with 2x2 sub-Gaussians enabled.
 
 Contract:
 
 - model forward receives only source views
 - target images are used only as render loss targets
-- target poses may use GT pose/geometry for bootstrap, then transition to predicted
-  geometry after the signal is stable
+- target poses use explicit GT bootstrap in this stage
 - color bootstrap is computed only from source images
+- 2x2 sub-Gaussians are enabled through `model.gs_subgrid_size: 2`
 
 Advance when held-out target views improve without source reconstruction regressing
 badly.
@@ -103,6 +111,8 @@ badly.
 ## Stage 3: Tangent-Frame Rotation And SH Residuals
 
 Purpose: open angular/color capacity after geometry is already stable.
+
+Config: `training/config/gs/stage3_full_head.yaml`.
 
 Trainable parameters:
 

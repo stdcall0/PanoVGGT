@@ -1,0 +1,90 @@
+# @package _global_
+# Stage 2c: novel-view bootstrap after bounded source-view geometry is stable.
+# Model forward sees source views only; target images are render-loss targets.
+
+defaults:
+  - /gs/local
+  - _self_
+
+exp_name: gs_stage2c_novel_view
+max_epochs: 300
+limit_train_batches: 300
+limit_val_batches: 50
+
+loss:
+  gs:
+    photometric_mode: novel_view
+    view_split_location: trainer
+    bootstrap_geometry_source: gt
+    target_policy: last
+    num_target_views: 1
+    self_recon: False
+    mask_rgb_by_valid: False
+    rgb_loss_type: charbonnier
+    charbonnier_eps: 0.001
+    solid_angle_weight: True
+    depth_weight: 0.0
+    scale_init_factor: 0.75
+    scale_mult_min: 0.25
+    scale_mult_max: 1.5
+    scale_reg_weight: 0.0025
+    scale_reg_target: 1.0
+    coverage_weight: 0.003
+    coverage_target_alpha: 1.0
+    front_floater_weight: 0.00001
+    front_floater_margin: 0.03
+    front_floater_depth_source: gt
+    offset_reg_weight: 0.000001
+    offset_max_ratio: 0.5
+    use_offset: True
+    train_dc: True
+    train_opacity: True
+    train_scale: True
+    train_rotation: False
+    train_sh_rest: False
+    rotation_init_mode: tangent
+
+optim:
+  frozen_module_names:
+    - aggregator
+    - point_decoder
+    - point_head
+    - camera_decoder
+    - camera_head
+    - global_points_decoder
+    - global_point_head
+    - pos_adapters
+    - gaussian_head.rotation
+    - gaussian_head.sh_rest
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 3e-7
+    weight_decay: 0.0
+  options:
+    lr:
+      - param_names:
+          - module.gaussian_head.scale.*
+          - module.gaussian_head.offset.*
+        scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 1e-7
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 3e-7
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.0
+
+checkpoint:
+  save_dir: ./outputs/${exp_name}/ckpts
+  save_freq: 10
+  resume_checkpoint_path: ./outputs/gs_stage2b_coverage/ckpts/checkpoint.pt
+  strict: False
+
+logging:
+  log_dir: ./outputs/${exp_name}
+  log_exp: ${exp_name}
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ./outputs/tensorboard/${exp_name}
