@@ -239,13 +239,11 @@ class CubePanoRenderer(nn.Module):
             face_w2c_all.append(self._build_face_viewmats(w2c_per_view[v]))
         face_w2c_all = torch.cat(face_w2c_all, dim=0)                    # (6V,4,4)
 
-        bg = (
-            None
-            if self.bg_color is None
-            else torch.full(
+        bg = None
+        if self.bg_color is not None and float(self.bg_color) != 0.0:
+            bg = torch.full(
                 (6 * V, 3), float(self.bg_color), device=device, dtype=dtype
             )
-        )
 
         rasterization = self._load_rasterization()
         rgb, alpha, _info = rasterization(

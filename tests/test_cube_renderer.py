@@ -50,6 +50,37 @@ def test_cube_renderer_passes_background_and_normalizes_depth_moment_after_proje
     torch.testing.assert_close(out["depth_erp"], torch.full((1, 1, 1, 1), 3.0))
 
 
+def test_cube_renderer_omits_explicit_zero_background_for_packed_rgbd():
+    renderer = CubePanoRenderer(
+        equ_h=1,
+        face_res=1,
+        fov_deg=90.0,
+        boundary_px=0,
+        sh_degree=1,
+        bg_color=0.0,
+    )
+    renderer.cube2equi = _SumFacesCubeToEqui()
+    calls = {}
+
+    def fake_rasterization(**kwargs):
+        calls.update(kwargs)
+        return torch.zeros(6, 1, 1, 4), torch.zeros(6, 1, 1, 1), {}
+
+    renderer._rasterization = fake_rasterization
+    renderer.render(
+        means=torch.zeros(1, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        scales=torch.ones(1, 3),
+        opacities=torch.ones(1),
+        colors_sh=torch.zeros(1, 4, 3),
+        w2c_per_view=torch.eye(4).view(1, 4, 4),
+    )
+
+    assert calls["render_mode"] == "RGB+D"
+    assert calls["packed"] is True
+    assert calls["backgrounds"] is None
+
+
 def test_cube_renderer_reuses_static_tensors_for_same_device_and_dtype():
     renderer = CubePanoRenderer(
         equ_h=2,
