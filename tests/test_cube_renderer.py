@@ -48,3 +48,26 @@ def test_cube_renderer_passes_background_and_normalizes_depth_moment_after_proje
     torch.testing.assert_close(calls["backgrounds"], torch.full((6, 3), 0.25))
     torch.testing.assert_close(out["alpha_erp"], torch.full((1, 1, 1, 1), 2.0))
     torch.testing.assert_close(out["depth_erp"], torch.full((1, 1, 1, 1), 3.0))
+
+
+def test_cube_renderer_reuses_static_tensors_for_same_device_and_dtype():
+    renderer = CubePanoRenderer(
+        equ_h=2,
+        face_res=4,
+        fov_deg=90.0,
+        boundary_px=1,
+        sh_degree=1,
+    )
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    K1 = renderer._intrinsics(device=device, dtype=dtype)
+    K2 = renderer._intrinsics(device=device, dtype=dtype)
+    ray1 = renderer._face_ray_norm(device=device, dtype=dtype)
+    ray2 = renderer._face_ray_norm(device=device, dtype=dtype)
+    mask1 = renderer._boundary_mask(device=device, dtype=dtype)
+    mask2 = renderer._boundary_mask(device=device, dtype=dtype)
+
+    assert K1.data_ptr() == K2.data_ptr()
+    assert ray1.data_ptr() == ray2.data_ptr()
+    assert mask1.data_ptr() == mask2.data_ptr()

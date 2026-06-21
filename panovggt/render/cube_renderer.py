@@ -100,6 +100,9 @@ class CubePanoRenderer(nn.Module):
         )
         self.register_buffer("face_R", opencv_face_rotations())  # (6, 3, 3)
         self._rasterization = None
+        self._intrinsic_cache = {}
+        self._face_ray_norm_cache = {}
+        self._boundary_mask_cache = {}
 
     def _load_rasterization(self):
         if self._rasterization is None:
@@ -125,6 +128,14 @@ class CubePanoRenderer(nn.Module):
         self.cube2equi = Cube2Equirec(
             face_w=face_res, equ_h=equ_h, equ_w=self.equ_w, fov_deg=self.fov_deg
         ).to(self.face_R.device)
+        self._intrinsic_cache.clear()
+        self._face_ray_norm_cache.clear()
+        self._boundary_mask_cache.clear()
+
+    @staticmethod
+    def _cache_key(device, dtype):
+        device = torch.device(device)
+        return (device.type, device.index, dtype)
 
     def _build_face_viewmats(self, w2c: torch.Tensor) -> torch.Tensor:
         """Compose face_w2c = face_R^T @ w2c for all 6 faces.
@@ -148,18 +159,35 @@ class CubePanoRenderer(nn.Module):
         face_w2c[:, 3, 3] = 1.0
         return face_w2c
 
-    def _boundary_mask(self) -> torch.Tensor:
-        m = torch.ones(1, 1, 6, self.face_res, self.face_res, dtype=torch.float32)
+    def _intrinsics(self, device, dtype) -> torch.Tensor:
+        key = self._cache_key(device, dtype)
+        K = self._intrinsic_cache.get(key)
+        if K is None:
+            K = _make_intrinsic(self.face_res, self.fov_rad, device, dtype)
+            self._intrinsic_cache[key] = K
+        return K
+
+    def _boundary_mask(self, device, dtype) -> torch.Tensor:
+        key = self._cache_key(device, dtype)
+        m = self._boundary_mask_cache.get(key)
+        if m is not None:
+            return m
+        m = torch.ones(1, 1, 6, self.face_res, self.face_res, device=device, dtype=dtype)
         bp = self.boundary_px
         if bp > 0:
             m[..., :bp, :] = 0.0
             m[..., -bp:, :] = 0.0
             m[..., :, :bp] = 0.0
             m[..., :, -bp:] = 0.0
+        self._boundary_mask_cache[key] = m
         return m
 
     def _face_ray_norm(self, device, dtype) -> torch.Tensor:
         """Per-face factor converting perspective z-depth to radial depth."""
+        key = self._cache_key(device, dtype)
+        cached = self._face_ray_norm_cache.get(key)
+        if cached is not None:
+            return cached
         f = 0.5 * self.face_res / math.tan(0.5 * self.fov_rad)
         c = (self.face_res - 1) / 2.0
         ys, xs = torch.meshgrid(
@@ -169,9 +197,11 @@ class CubePanoRenderer(nn.Module):
         )
         x = (xs - c) / f
         y = (ys - c) / f
-        return torch.sqrt(x.square() + y.square() + 1.0).view(
+        ray_norm = torch.sqrt(x.square() + y.square() + 1.0).view(
             1, self.face_res, self.face_res, 1
         )
+        self._face_ray_norm_cache[key] = ray_norm
+        return ray_norm
 
     def render(
         self,
@@ -200,7 +230,7 @@ class CubePanoRenderer(nn.Module):
         device = means.device
         dtype = means.dtype
         V = w2c_per_view.shape[0]
-        K = _make_intrinsic(self.face_res, self.fov_rad, device, dtype)  # (3,3)
+        K = self._intrinsics(device=device, dtype=dtype)                 # (3,3)
         Ks = K.unsqueeze(0).expand(6 * V, 3, 3).contiguous()             # (6V,3,3)
 
         # Build per-face viewmats for every input view.
@@ -253,7 +283,7 @@ class CubePanoRenderer(nn.Module):
         depth_moment_cube = _to_cube(depth_moment)
         alpha_cube = _to_cube(alpha)
 
-        boundary = self._boundary_mask().to(device=device, dtype=dtype)     # (1,1,6,h,w)
+        boundary = self._boundary_mask(device=device, dtype=dtype)          # (1,1,6,h,w)
         mask_cube = boundary.expand(V, 1, 6, self.face_res, self.face_res)  # (V,1,6,h,w)
 
         rgb_erp = self.cube2equi(rgb_cube)
