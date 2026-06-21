@@ -66,6 +66,48 @@ def patch_valid_ratio(mask: torch.Tensor, patch_size: int) -> torch.Tensor:
     return pooled.view(*mask.shape[:2], *pooled.shape[-2:])
 
 
+def _reshape_subgrid_pooled(x: torch.Tensor, subgrid_size: int, channel_last: bool) -> torch.Tensor:
+    if subgrid_size == 1:
+        if channel_last:
+            return x.unsqueeze(-2)
+        return x.permute(0, 1, 3, 4, 2).contiguous().unsqueeze(-2)
+    if channel_last:
+        B, S, Hs, Ws, C = x.shape
+        Hp, Wp = Hs // subgrid_size, Ws // subgrid_size
+        x = x.view(B, S, Hp, subgrid_size, Wp, subgrid_size, C)
+        return x.permute(0, 1, 2, 4, 3, 5, 6).reshape(
+            B, S, Hp, Wp, subgrid_size * subgrid_size, C
+        )
+    B, S, C, Hs, Ws = x.shape
+    Hp, Wp = Hs // subgrid_size, Ws // subgrid_size
+    x = x.view(B, S, C, Hp, subgrid_size, Wp, subgrid_size)
+    return x.permute(0, 1, 3, 5, 4, 6, 2).reshape(
+        B, S, Hp, Wp, subgrid_size * subgrid_size, C
+    )
+
+
+def subpatch_pool(x: torch.Tensor, patch_size: int, subgrid_size: int) -> torch.Tensor:
+    """Average-pool a map into a per-patch subgrid with Q = subgrid_size^2."""
+    if patch_size % subgrid_size != 0:
+        raise ValueError(
+            f"patch_size={patch_size} must be divisible by subgrid_size={subgrid_size}."
+        )
+    subpatch_size = patch_size // subgrid_size
+    pooled = patch_pool(x, subpatch_size)
+    channel_last = pooled.shape[-1] in (1, 3) and pooled.shape[-3] != pooled.shape[-1]
+    return _reshape_subgrid_pooled(pooled, subgrid_size, channel_last=channel_last)
+
+
+def subpatch_valid_ratio(mask: torch.Tensor, patch_size: int, subgrid_size: int) -> torch.Tensor:
+    if patch_size % subgrid_size != 0:
+        raise ValueError(
+            f"patch_size={patch_size} must be divisible by subgrid_size={subgrid_size}."
+        )
+    subpatch_size = patch_size // subgrid_size
+    pooled = patch_valid_ratio(mask, subpatch_size)
+    return _reshape_subgrid_pooled(pooled.unsqueeze(-1), subgrid_size, channel_last=True).squeeze(-1)
+
+
 def depth_footprint_scale(
     depth: torch.Tensor,
     patch_size: int,
@@ -120,6 +162,22 @@ def depth_footprint_scale(
     s = (pooled * angular).clamp_min(1e-4)
     s = s.view(*depth.shape[:2], *s.shape[-2:])  # (B,S,Hp,Wp)
     return s.unsqueeze(-1).expand(*s.shape, 3).contiguous()
+
+
+def subpatch_depth_footprint_scale(
+    depth: torch.Tensor,
+    patch_size: int,
+    subgrid_size: int,
+    H: int,
+    valid_mask=None,
+) -> torch.Tensor:
+    if patch_size % subgrid_size != 0:
+        raise ValueError(
+            f"patch_size={patch_size} must be divisible by subgrid_size={subgrid_size}."
+        )
+    subpatch_size = patch_size // subgrid_size
+    scale = depth_footprint_scale(depth, subpatch_size, H, valid_mask=valid_mask)
+    return _reshape_subgrid_pooled(scale, subgrid_size, channel_last=True)
 
 
 @torch.no_grad()

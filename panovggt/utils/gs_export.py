@@ -76,8 +76,11 @@ def aggregate_predictions(
     from panovggt.render.gs_branch import materialize_gaussians
 
     g = pred["gaussian"]
-    if g["sh_dc"].dim() != 5:
-        raise ValueError(f"expected gaussian tensors with shape [B,S,Hp,Wp,C], got {g['sh_dc'].shape}")
+    if g["sh_dc"].dim() not in (5, 6):
+        raise ValueError(
+            "expected gaussian tensors with shape [B,S,Hp,Wp,C] or "
+            f"[B,S,Hp,Wp,Q,C], got {g['sh_dc'].shape}"
+        )
     if "world_points" not in pred or "images" not in pred:
         raise KeyError("GS export requires `world_points` and `images` to materialize training-time Gaussians.")
 

@@ -35,18 +35,30 @@ _INPUT_H = 518
 _INPUT_W = 1036
 
 
-def ensure_batched_gs_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
+def ensure_batched_gs_tensor(x: torch.Tensor, name: str, subgrid_size: int = 1) -> torch.Tensor:
     param_name = name.rsplit(".", 1)[-1]
     if param_name == "sh_rest":
-        if x.dim() == 5:
-            return x.unsqueeze(0)
-        if x.dim() == 6:
-            return x
+        if subgrid_size > 1:
+            if x.dim() == 6:
+                return x.unsqueeze(0)
+            if x.dim() == 7:
+                return x
+        else:
+            if x.dim() == 5:
+                return x.unsqueeze(0)
+            if x.dim() == 6:
+                return x
     else:
-        if x.dim() == 4:
-            return x.unsqueeze(0)
-        if x.dim() == 5:
-            return x
+        if subgrid_size > 1:
+            if x.dim() == 5:
+                return x.unsqueeze(0)
+            if x.dim() == 6:
+                return x
+        else:
+            if x.dim() == 4:
+                return x.unsqueeze(0)
+            if x.dim() == 5:
+                return x
     raise ValueError(f"unexpected GS tensor shape for {name}: {tuple(x.shape)}")
 
 
@@ -191,6 +203,7 @@ def load_model(config_path: str, checkpoint_path: str, device: str, enable_gauss
         model_kwargs["gs_sh_degree"] = int(getattr(mc, "gs_sh_degree", 1))
         model_kwargs["gs_scale_init"] = float(getattr(mc, "gs_scale_init", 0.01))
         model_kwargs["gs_opacity_init"] = float(getattr(mc, "gs_opacity_init", 0.1))
+        model_kwargs["gs_subgrid_size"] = int(getattr(mc, "gs_subgrid_size", 1))
     elif "enable_global_points" in mc:
         model_kwargs["enable_global_points"] = bool(mc.enable_global_points)
     model = PanoVGGTModel(**model_kwargs)
@@ -681,13 +694,18 @@ def main(args: argparse.Namespace) -> None:
             camera_poses=poses_t,
             depth=depth_t,
         )
+        from panovggt.utils.gs_export import aggregate_predictions, gs_to_ply
+        gs_conf = load_gs_conf(args.config)
+        subgrid_size = int(getattr(model, "gs_subgrid_size", 1))
         gs_tensors = {}
         for k, v in gs_dict.items():
             if isinstance(v, torch.Tensor):
                 vv = v
             else:
                 vv = torch.from_numpy(v)
-            gs_tensors[k] = ensure_batched_gs_tensor(vv, f"gaussian.{k}")
+            gs_tensors[k] = ensure_batched_gs_tensor(
+                vv, f"gaussian.{k}", subgrid_size=subgrid_size
+            )
         wrap = {
             "gaussian": gs_tensors,
             "world_points": wp_t,
@@ -695,8 +713,6 @@ def main(args: argparse.Namespace) -> None:
             "depth": depth_t,
             "point_masks": point_masks_t,
         }
-        from panovggt.utils.gs_export import aggregate_predictions, gs_to_ply
-        gs_conf = load_gs_conf(args.config)
         agg = aggregate_predictions(
             wrap,
             sh_degree=int(getattr(model, "gs_sh_degree", 1)),

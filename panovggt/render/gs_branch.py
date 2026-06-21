@@ -20,7 +20,15 @@ import torch
 
 from panovggt.utils.geometry import se3_inverse
 from .gs_geometry import normalize_quaternion, quat_multiply, tangent_frame_quaternions
-from .gs_utils import patch_pool, patch_valid_ratio, depth_footprint_scale, knn_scale
+from .gs_utils import (
+    patch_pool,
+    patch_valid_ratio,
+    depth_footprint_scale,
+    knn_scale,
+    subpatch_depth_footprint_scale,
+    subpatch_pool,
+    subpatch_valid_ratio,
+)
 
 
 def _smooth_bounded_scale_multiplier(
@@ -139,48 +147,84 @@ class GSBranch:
         patch_size = H // gs_params["sh_dc"].shape[2]
         Hp = gs_params["sh_dc"].shape[2]
         Wp = gs_params["sh_dc"].shape[3]
+        has_subgrid = gs_params["sh_dc"].dim() == 6
+        Q = gs_params["sh_dc"].shape[4] if has_subgrid else 1
+        subgrid_size = int(round(Q ** 0.5))
+        if subgrid_size * subgrid_size != Q:
+            raise ValueError(f"subgrid Gaussian count must be square, got Q={Q}.")
         assert patch_size * Hp == H and patch_size * Wp == W, (patch_size, Hp, Wp, H, W)
+
+        def with_q(x: torch.Tensor) -> torch.Tensor:
+            return x if has_subgrid else x.unsqueeze(4)
+
+        def maybe_squeeze_q(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if x is None or has_subgrid:
+                return x
+            return x.squeeze(4)
+
+        gs_offset = with_q(gs_params["offset"])
+        gs_scale = with_q(gs_params["scale"])
+        gs_rotation = with_q(gs_params["rotation"])
+        gs_opacity = with_q(gs_params["opacity"])
+        gs_sh_dc = with_q(gs_params["sh_dc"])
+        gs_sh_rest = gs_params["sh_rest"] if has_subgrid else gs_params["sh_rest"].unsqueeze(4)
 
         # ---- centers ------------------------------------------------------
         patch_valid = None
         if point_masks is not None:
-            patch_valid = patch_valid_ratio(point_masks, patch_size).unsqueeze(-1)
+            if has_subgrid:
+                patch_valid = subpatch_valid_ratio(
+                    point_masks, patch_size, subgrid_size
+                ).unsqueeze(-1)
+            else:
+                patch_valid = patch_valid_ratio(point_masks, patch_size).unsqueeze(-1).unsqueeze(4)
 
-        centers_pp = patch_pool(world_points, patch_size)  # (B,S,Hp,Wp,3)
+        if has_subgrid:
+            centers_pp = subpatch_pool(world_points, patch_size, subgrid_size)
+        else:
+            centers_pp = patch_pool(world_points, patch_size).unsqueeze(4)
         if self.detach_centers:
             centers_pp = centers_pp.detach()
 
         # ---- color init ---------------------------------------------------
         # patch-pool the GT image to get a per-Gaussian DC bootstrap.
-        img_pp = patch_pool(images, patch_size)              # (B,S,3,Hp,Wp)
-        img_pp = img_pp.permute(0, 1, 3, 4, 2).contiguous()  # (B,S,Hp,Wp,3)
+        if has_subgrid:
+            img_pp = subpatch_pool(images, patch_size, subgrid_size)
+        else:
+            img_pp = patch_pool(images, patch_size)
+            img_pp = img_pp.permute(0, 1, 3, 4, 2).contiguous().unsqueeze(4)
         # gsplat with sh_degree expects DC stored as (rgb-0.5)/C0; we use the
         # PixelSplat convention where the coefficient lives at K=0.
         C0 = 0.28209479177387814  # 1/(2*sqrt(pi))
         dc_init = (img_pp - 0.5) / C0
-        sh_dc = self._gate(gs_params["sh_dc"] + dc_init.detach(), dc_init, "sh_dc")
+        sh_dc = self._gate(gs_sh_dc + dc_init.detach(), dc_init, "sh_dc")
         # For sh_rest, init is zeros which is exactly the gate's default
         sh_rest = self._gate(
-            gs_params["sh_rest"], torch.zeros_like(gs_params["sh_rest"]), "sh_rest"
+            gs_sh_rest, torch.zeros_like(gs_sh_rest), "sh_rest"
         )
 
         # ---- scale init ---------------------------------------------------
         if self.scale_init_mode == "depth_footprint" and depth is not None:
             d = depth if depth.dim() == 4 else depth.squeeze(-1)
-            scale_init = depth_footprint_scale(
-                d, patch_size, H, valid_mask=point_masks
-            )        # (B,S,Hp,Wp,3)
+            if has_subgrid:
+                scale_init = subpatch_depth_footprint_scale(
+                    d, patch_size, subgrid_size, H, valid_mask=point_masks
+                )
+            else:
+                scale_init = depth_footprint_scale(
+                    d, patch_size, H, valid_mask=point_masks
+                ).unsqueeze(4)
         elif self.scale_init_mode == "knn":
             scale_init = knn_scale(centers_pp.detach(), k=3)
         else:
-            scale_init = torch.full_like(gs_params["scale"], float(self.scale_init_value))
+            scale_init = torch.full_like(gs_scale, float(self.scale_init_value))
         scale_init = scale_init * self.scale_init_factor
         # Keep the configured scale init as the geometric prior. The head's
         # softplus output is initialized to scale_init_value, so this starts at
         # scale_init and learns a positive multiplicative correction.
         if self.train_flags["scale"]:
             scale_mult, scale_log_raw = _smooth_bounded_scale_multiplier(
-                raw_scale=gs_params["scale"],
+                raw_scale=gs_scale,
                 scale_init_value=self.scale_init_value,
                 scale_mult_min=self.scale_mult_min,
                 scale_mult_max=self.scale_mult_max,
@@ -196,7 +240,7 @@ class GSBranch:
         # absolute world-space displacement. Binding it to scale_init prevents
         # offset freedom from silently growing when learned scales grow.
         if self.use_offset and self.train_flags["offset"]:
-            offset_ratio = torch.tanh(gs_params["offset"]) * self.offset_max_ratio
+            offset_ratio = torch.tanh(gs_offset) * self.offset_max_ratio
             offset = offset_ratio * scale_init.detach()
             centers = centers_pp + offset
         else:
@@ -208,7 +252,7 @@ class GSBranch:
         if self.rotation_init_mode == "tangent":
             rotation_init = tangent_frame_quaternions(centers_pp.detach())
         elif self.rotation_init_mode == "identity":
-            rotation_init = gs_params["rotation"].new_zeros(gs_params["rotation"].shape)
+            rotation_init = gs_rotation.new_zeros(gs_rotation.shape)
             rotation_init[..., 0] = 1.0
         else:
             raise ValueError(
@@ -216,12 +260,12 @@ class GSBranch:
                 "expected 'identity' or 'tangent'."
             )
         if self.train_flags["rotation"]:
-            rotation_final = quat_multiply(rotation_init, gs_params["rotation"])
+            rotation_final = quat_multiply(rotation_init, gs_rotation)
         else:
             rotation_final = normalize_quaternion(rotation_init)
 
         # opacity
-        opacity_final = gs_params["opacity"]
+        opacity_final = gs_opacity
         if not self.train_flags["opacity"]:
             opacity_final = opacity_final.detach()
         if patch_valid is not None:
@@ -239,27 +283,28 @@ class GSBranch:
                 sh_rest = torch.cat([sh_rest, pad], dim=-1)
             else:
                 sh_rest = sh_rest[..., : K - 1]
-        # combine to (B,S,Hp,Wp,K,3)
+        # combine to (B,S,Hp,Wp,Q,K,3)
         sh_dc_kx = sh_dc.unsqueeze(-2)                             # (...,1,3)
-        sh_rest_kx = sh_rest.permute(0, 1, 2, 3, 5, 4).contiguous()  # (...,K-1,3)
+        sh_rest_kx = sh_rest.permute(0, 1, 2, 3, 4, 6, 5).contiguous()  # (...,K-1,3)
         colors_sh = torch.cat([sh_dc_kx, sh_rest_kx], dim=-2)      # (...,K,3)
 
         return dict(
-            centers=centers,
-            offset=offset,
-            offset_ratio=offset_ratio,
-            scales=scale_final,
-            scale_init=scale_init,
-            scale_mult=scale_mult,
-            scale_log_raw=scale_log_raw,
-            scale_mult_clamped=scale_mult,
-            rotations=rotation_final,
-            opacities=opacity_final,
-            patch_valid=patch_valid,
-            sh_dc=sh_dc,
-            sh_rest=sh_rest,
-            colors_sh=colors_sh,
+            centers=maybe_squeeze_q(centers),
+            offset=maybe_squeeze_q(offset),
+            offset_ratio=maybe_squeeze_q(offset_ratio),
+            scales=maybe_squeeze_q(scale_final),
+            scale_init=maybe_squeeze_q(scale_init),
+            scale_mult=maybe_squeeze_q(scale_mult),
+            scale_log_raw=maybe_squeeze_q(scale_log_raw),
+            scale_mult_clamped=maybe_squeeze_q(scale_mult),
+            rotations=maybe_squeeze_q(rotation_final),
+            opacities=maybe_squeeze_q(opacity_final),
+            patch_valid=maybe_squeeze_q(patch_valid),
+            sh_dc=maybe_squeeze_q(sh_dc),
+            sh_rest=maybe_squeeze_q(sh_rest),
+            colors_sh=maybe_squeeze_q(colors_sh),
             patch_size=torch.as_tensor(patch_size, device=world_points.device),
+            subgrid_size=torch.as_tensor(subgrid_size, device=world_points.device),
         )
 
     # ---------------------------------------------------------------------

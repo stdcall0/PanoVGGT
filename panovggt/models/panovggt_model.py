@@ -139,6 +139,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         gs_sh_degree: int = 1,
         gs_scale_init: float = 0.01,
         gs_opacity_init: float = 0.1,
+        gs_subgrid_size: int = 1,
         **kwargs,
     ):
         super().__init__()
@@ -159,6 +160,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
         self.enable_global_points = enable_global_points
         self.enable_gaussian = enable_gaussian
         self.gs_sh_degree = int(gs_sh_degree)
+        self.gs_subgrid_size = int(gs_subgrid_size)
 
         # 3) Decoder heads
         in_dim_for_decoders = 2 * embed_dim
@@ -208,6 +210,7 @@ class PanoVGGTModel(nn.Module, PyTorchModelHubMixin):
                 sh_degree=self.gs_sh_degree,
                 scale_init=gs_scale_init,
                 opacity_init=gs_opacity_init,
+                subgrid_size=self.gs_subgrid_size,
             )
 
         # 4) Absolute spherical position encoding adapters

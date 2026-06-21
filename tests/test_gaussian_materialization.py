@@ -32,8 +32,18 @@ def _make_branch(**overrides):
     return branch
 
 
-def _make_gs_params(batch=1, views=1, patch_h=2, patch_w=2, sh_degree=1):
+def _make_gs_params(batch=1, views=1, patch_h=2, patch_w=2, sh_degree=1, subgrid_size=1):
     sh_rest_channels = (sh_degree + 1) ** 2 - 1
+    q = subgrid_size * subgrid_size
+    if q > 1:
+        return {
+            "offset": torch.zeros(batch, views, patch_h, patch_w, q, 3),
+            "scale": torch.full((batch, views, patch_h, patch_w, q, 3), 0.01),
+            "rotation": torch.zeros(batch, views, patch_h, patch_w, q, 4),
+            "opacity": torch.ones(batch, views, patch_h, patch_w, q, 1),
+            "sh_dc": torch.zeros(batch, views, patch_h, patch_w, q, 3),
+            "sh_rest": torch.zeros(batch, views, patch_h, patch_w, q, 3, sh_rest_channels),
+        }
     return {
         "offset": torch.zeros(batch, views, patch_h, patch_w, 3),
         "scale": torch.full((batch, views, patch_h, patch_w, 3), 0.01),
@@ -228,3 +238,48 @@ def test_tangent_rotation_init_aligns_local_z_to_center_ray():
 
     torch.testing.assert_close(rot[..., :, 2], torch.tensor([1.0, 0.0, 0.0]).expand(1, 1, 2, 2, 3))
     torch.testing.assert_close(out["rotations"].norm(dim=-1), torch.ones(1, 1, 2, 2))
+
+
+def test_linear_gaussian_head_can_emit_2x2_subgrid_tensors():
+    from panovggt.layers.gaussian_head import LinearGaussianHead
+
+    head = LinearGaussianHead(dec_embed_dim=8, sh_degree=1, subgrid_size=2)
+    out = head(torch.zeros(1, 1, 8), Hp=1, Wp=1, B=1, S=1)
+
+    assert out["sh_dc"].shape == (1, 1, 1, 1, 4, 3)
+    assert out["sh_rest"].shape == (1, 1, 1, 1, 4, 3, 3)
+    assert out["opacity"].shape == (1, 1, 1, 1, 4, 1)
+
+
+def test_materialize_2x2_subgrid_uses_subpatch_centers_and_color_bootstrap():
+    gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    values = [0.1, 0.2, 0.3, 0.4]
+    for idx, (y0, x0) in enumerate(((0, 0), (0, 2), (2, 0), (2, 2))):
+        world_points[:, :, y0:y0 + 2, x0:x0 + 2, 0] = float(idx)
+        images[:, :, :, y0:y0 + 2, x0:x0 + 2] = values[idx]
+
+    out = _make_branch().materialize(gs_params, world_points, images)
+
+    assert out["centers"].shape == (1, 1, 1, 1, 4, 3)
+    torch.testing.assert_close(out["centers"][0, 0, 0, 0, :, 0], torch.arange(4, dtype=torch.float32))
+    c0 = 0.28209479177387814
+    expected_dc = (torch.tensor(values) - 0.5) / c0
+    torch.testing.assert_close(out["sh_dc"][0, 0, 0, 0, :, 0], expected_dc)
+
+
+def test_aggregate_predictions_flattens_2x2_subgrid_gaussians():
+    from panovggt.utils.gs_export import aggregate_predictions
+
+    gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+
+    agg = aggregate_predictions(
+        {"gaussian": gs_params, "world_points": world_points, "images": images},
+        sh_degree=1,
+        gs_conf={"scale_init_mode": "constant", "scale_init_value": 0.01},
+    )
+
+    assert agg["means"].shape == (4, 3)

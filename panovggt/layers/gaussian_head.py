@@ -46,6 +46,7 @@ class LinearGaussianHead(nn.Module):
         sh_degree: int = 1,
         scale_init: float = 0.01,
         opacity_init: float = 0.1,
+        subgrid_size: int = 1,
     ):
         super().__init__()
         self.dec_embed_dim = dec_embed_dim
@@ -53,21 +54,30 @@ class LinearGaussianHead(nn.Module):
         self.sh_extra = (sh_degree + 1) ** 2 - 1 if sh_degree > 0 else 0
         self.scale_init = float(scale_init)
         self.opacity_init = float(opacity_init)
+        self.subgrid_size = int(subgrid_size)
+        self.subgrid_count = self.subgrid_size * self.subgrid_size
 
-        self.offset = nn.Linear(dec_embed_dim, 3)
-        self.scale = nn.Linear(dec_embed_dim, 3)
-        self.rotation = nn.Linear(dec_embed_dim, 4)
-        self.opacity = nn.Linear(dec_embed_dim, 1)
-        self.sh_dc = nn.Linear(dec_embed_dim, 3)
-        self.sh_rest = nn.Linear(dec_embed_dim, 3 * self.sh_extra) if self.sh_extra > 0 else None
+        self.offset = nn.Linear(dec_embed_dim, 3 * self.subgrid_count)
+        self.scale = nn.Linear(dec_embed_dim, 3 * self.subgrid_count)
+        self.rotation = nn.Linear(dec_embed_dim, 4 * self.subgrid_count)
+        self.opacity = nn.Linear(dec_embed_dim, self.subgrid_count)
+        self.sh_dc = nn.Linear(dec_embed_dim, 3 * self.subgrid_count)
+        self.sh_rest = (
+            nn.Linear(dec_embed_dim, 3 * self.sh_extra * self.subgrid_count)
+            if self.sh_extra > 0 else None
+        )
 
         scale_bias = float(_softplus_inv(torch.tensor(self.scale_init)).item())
         opacity_bias = float(math.log(self.opacity_init / (1.0 - self.opacity_init)))
 
         _init_linear(self.offset, weight_scale=1e-4, bias=0.0)
         _init_linear(self.scale, weight_scale=1e-4, bias=scale_bias)
-        _init_linear(self.rotation, weight_scale=1e-4, bias=0.0,
-                     bias_vec=[1.0, 0.0, 0.0, 0.0])
+        _init_linear(
+            self.rotation,
+            weight_scale=1e-4,
+            bias=0.0,
+            bias_vec=[1.0, 0.0, 0.0, 0.0] * self.subgrid_count,
+        )
         _init_linear(self.opacity, weight_scale=1e-4, bias=opacity_bias)
         _init_linear(self.sh_dc, weight_scale=1e-4, bias=0.0)
         if self.sh_rest is not None:
@@ -76,8 +86,12 @@ class LinearGaussianHead(nn.Module):
     @property
     def out_dim_summary(self) -> Dict[str, int]:
         return dict(
-            offset=3, scale=3, rotation=4, opacity=1,
-            sh_dc=3, sh_rest=3 * self.sh_extra,
+            offset=3 * self.subgrid_count,
+            scale=3 * self.subgrid_count,
+            rotation=4 * self.subgrid_count,
+            opacity=self.subgrid_count,
+            sh_dc=3 * self.subgrid_count,
+            sh_rest=3 * self.sh_extra * self.subgrid_count,
         )
 
     def forward(
@@ -97,7 +111,8 @@ class LinearGaussianHead(nn.Module):
         assert BS == B * S and N == Hp * Wp, (BS, N, B, S, Hp, Wp)
 
         def _r(x, last):
-            return x.view(B, S, Hp, Wp, last)
+            x = x.view(B, S, Hp, Wp, self.subgrid_count, last)
+            return x.squeeze(-2) if self.subgrid_count == 1 else x
 
         offset_raw = _r(self.offset(tokens), 3)
         scale_raw = _r(self.scale(tokens), 3)
@@ -105,10 +120,15 @@ class LinearGaussianHead(nn.Module):
         opacity_raw = _r(self.opacity(tokens), 1)
         dc_raw = _r(self.sh_dc(tokens), 3)
         if self.sh_rest is not None:
-            rest_raw = _r(self.sh_rest(tokens), 3 * self.sh_extra)
-            sh_rest = rest_raw.view(B, S, Hp, Wp, 3, self.sh_extra)
+            rest_raw = self.sh_rest(tokens).view(
+                B, S, Hp, Wp, self.subgrid_count, 3, self.sh_extra
+            )
+            sh_rest = rest_raw.squeeze(-3) if self.subgrid_count == 1 else rest_raw
         else:
-            sh_rest = dc_raw.new_zeros(B, S, Hp, Wp, 3, 0)
+            if self.subgrid_count == 1:
+                sh_rest = dc_raw.new_zeros(B, S, Hp, Wp, 3, 0)
+            else:
+                sh_rest = dc_raw.new_zeros(B, S, Hp, Wp, self.subgrid_count, 3, 0)
 
         scale = F.softplus(scale_raw) + 1e-6
         rotation = rot_raw / (rot_raw.norm(dim=-1, keepdim=True) + 1e-8)

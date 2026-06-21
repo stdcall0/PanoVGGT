@@ -20,6 +20,7 @@ model:
   enable_global_points: True
   enable_gaussian: True
   gs_sh_degree: 1
+  gs_subgrid_size: 2
   gs_scale_init: 0.01
   gs_opacity_init: 0.1
 
