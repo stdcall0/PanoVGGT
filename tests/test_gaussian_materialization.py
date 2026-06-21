@@ -2,7 +2,11 @@ import math
 
 import torch
 
-from panovggt.render.gs_branch import GSBranch, materialize_gaussians
+from panovggt.render.gs_branch import (
+    GSBranch,
+    _smooth_bounded_scale_multiplier,
+    materialize_gaussians,
+)
 
 
 def _make_branch(**overrides):
@@ -194,6 +198,27 @@ def test_smooth_bounded_scale_keeps_gradients_near_upper_bound():
 
     assert out["scale_mult"].max().item() < 1.25
     assert gs_params["scale"].grad.abs().sum().item() > 0.0
+
+
+def test_smooth_bounded_scale_bounds_do_not_call_tensor_item(monkeypatch):
+    raw_scale = torch.tensor([0.01 * math.exp(-2.0), 0.01, 0.01 * math.exp(2.0)])
+
+    def fail_item(self):
+        raise AssertionError("scale bounds must not call Tensor.item()")
+
+    monkeypatch.setattr(torch.Tensor, "item", fail_item)
+
+    scale_mult, scale_log_raw = _smooth_bounded_scale_multiplier(
+        raw_scale=raw_scale,
+        scale_init_value=0.01,
+        scale_mult_min=0.25,
+        scale_mult_max=1.25,
+    )
+
+    torch.testing.assert_close(scale_log_raw, torch.tensor([-2.0, 0.0, 2.0]))
+    assert scale_mult[0] > 0.25
+    assert scale_mult[1] == 1.0
+    assert scale_mult[2] < 1.25
 
 
 def test_scale_relative_offset_starts_at_zero():

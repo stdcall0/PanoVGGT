@@ -13,6 +13,7 @@ This module:
     4. Returns (rendered_rgb, rendered_depth, render_mask, gs_dict).
 """
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -41,14 +42,14 @@ def _smooth_bounded_scale_multiplier(
     scale_log_raw = torch.log(raw_scale.clamp_min(1e-8) / scale_ref)
     log_mult = scale_log_raw
     if scale_mult_min is not None:
-        min_log = abs(torch.log(raw_scale.new_tensor(float(scale_mult_min))).item())
+        min_log = abs(math.log(float(scale_mult_min)))
         log_mult = torch.where(
             scale_log_raw < 0,
             -min_log * torch.tanh(-scale_log_raw),
             log_mult,
         )
     if scale_mult_max is not None:
-        max_log = torch.log(raw_scale.new_tensor(float(scale_mult_max))).item()
+        max_log = math.log(float(scale_mult_max))
         log_mult = torch.where(
             scale_log_raw >= 0,
             max_log * torch.tanh(scale_log_raw),
