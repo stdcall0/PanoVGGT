@@ -696,7 +696,12 @@ class Loss(nn.Module):
         """
         local_points = pred['local_points']
         camera_poses = pred['camera_poses']
-        masks = gt['valid_masks']
+        source_idx = pred.get("gs_source_indices", None)
+        if source_idx is not None:
+            source_idx = source_idx.to(device=local_points.device, dtype=torch.long)
+            masks = gt['valid_masks'].index_select(1, source_idx)
+        else:
+            masks = gt['valid_masks']
         
         B, N, H, W, _ = local_points.shape
         pred['camera_poses_original'] = camera_poses
@@ -898,7 +903,29 @@ class Loss(nn.Module):
             )
 
         mode = self._gs_photometric_mode.lower()
-        if mode in ("source_recon", "reconstruction", "observed"):
+        split_before_forward = (
+            pred.get("gs_source_indices", None) is not None
+            and pred.get("gs_target_indices", None) is not None
+        )
+        source_full_idx = None
+        if split_before_forward:
+            if mode not in ("novel_view", "nvs", "source_target"):
+                raise ValueError(
+                    "trainer-side GS view split is only valid for novel_view/source_target modes."
+                )
+            source_full_idx = pred["gs_source_indices"].to(
+                device=world_points.device, dtype=torch.long
+            )
+            target_idx = pred["gs_target_indices"].to(
+                device=world_points.device, dtype=torch.long
+            )
+            if source_full_idx.numel() != S:
+                raise ValueError(
+                    "trainer-side GS source indices must match prediction view count, "
+                    f"got {source_full_idx.numel()} indices for S={S}."
+                )
+            source_idx = torch.arange(S, device=world_points.device)
+        elif mode in ("source_recon", "reconstruction", "observed"):
             source_idx = target_idx = torch.arange(S, device=world_points.device)
         elif mode in ("novel_view", "nvs", "source_target"):
             if S < 2:
@@ -1001,6 +1028,30 @@ class Loss(nn.Module):
         gt_norm_factor = gt.get("norm_factors", None)
         pred_norm_factor = pred.get("norm_factor", None)
 
+        def gt_target_camera_poses(target_view_idx: torch.Tensor):
+            pose_source = str(
+                self.gs_conf.get("bootstrap_geometry_source", "gt")
+            ).lower()
+            if pose_source not in ("gt", "ground_truth"):
+                raise ValueError(
+                    "trainer-side GS novel-view split requires "
+                    "loss.gs.bootstrap_geometry_source: gt."
+                )
+            if source_full_idx is None or source_full_idx.numel() == 0:
+                raise ValueError("missing GS source indices for target camera pose bootstrap.")
+            gt_camera_poses = gt["camera_poses"].to(
+                device=world_points.device, dtype=camera_poses.dtype
+            )
+            anchor_pose = gt_camera_poses.index_select(1, source_full_idx[:1])
+            anchor_w2c = invert_homogeneous_matrix(anchor_pose)
+            target_c2w = select_views(gt_camera_poses, target_view_idx)
+            rel = torch.matmul(anchor_w2c.float(), target_c2w.float()).to(camera_poses.dtype)
+            if pred_norm_factor is not None:
+                rel[..., :3, 3] /= pred_norm_factor.detach().view(B, 1, 1).to(
+                    device=rel.device, dtype=rel.dtype
+                )
+            return rel
+
         sh_dim = gs_params["sh_rest"].shape[-1]        # 3*sh_extra/3 = sh_extra
         # Recover sh_degree from rest dim (sh_extra = (deg+1)^2 - 1)
         sh_extra = sh_dim
@@ -1017,6 +1068,10 @@ class Loss(nn.Module):
         depth_masks = gt.get("depth_masks", valid_masks)
         source_gs_masks = gt.get("source_gs_masks", valid_masks)
         rgb_masks = gt.get("rgb_masks", None)
+        if split_before_forward and source_full_idx is not None:
+            source_gs_masks_for_pred = select_views(source_gs_masks, source_full_idx)
+        else:
+            source_gs_masks_for_pred = source_gs_masks
 
         if mode in ("source_recon", "reconstruction", "observed") and self._gs_self_recon:
             # Render each source view only from its own Gaussian set. This avoids
@@ -1028,7 +1083,7 @@ class Loss(nn.Module):
             flat_world_points = flatten_views(world_points)
             flat_depth_pred = flatten_views(depth_pred)
             flat_images = flatten_views(images)
-            flat_masks = flatten_views(source_gs_masks)
+            flat_masks = flatten_views(source_gs_masks_for_pred)
             flat_camera_poses = flatten_views(camera_poses)
             flat_gs_params = flatten_gs_params(gs_params)
 
@@ -1058,12 +1113,21 @@ class Loss(nn.Module):
             source_world_points = select_views(world_points, source_idx)
             source_depth_pred = select_views(depth_pred, source_idx)
             source_images = select_views(images, source_idx)
-            source_masks = select_views(source_gs_masks, source_idx)
+            source_masks = select_views(source_gs_masks_for_pred, source_idx)
             source_gs_params = select_gs_params(gs_params, source_idx)
-            render_camera_poses = select_views(camera_poses, target_idx)
-            target_images = select_views(images, target_idx)
+            render_camera_poses = (
+                gt_target_camera_poses(target_idx)
+                if split_before_forward
+                else select_views(camera_poses, target_idx)
+            )
+            target_image_bank = gt.get("imgs", images) if split_before_forward else images
+            target_images = select_views(target_image_bank, target_idx)
             target_depths_raw = select_views(gt.get("depths", None), target_idx)
-            target_pred_depths_raw = select_views(depth_pred.detach(), target_idx) if depth_pred is not None else None
+            target_pred_depths_raw = (
+                None
+                if split_before_forward or depth_pred is None
+                else select_views(depth_pred.detach(), target_idx)
+            )
             target_depth_masks_raw = select_views(depth_masks, target_idx)
             target_rgb_masks_raw = select_views(rgb_masks, target_idx)
             T = int(target_idx.numel())

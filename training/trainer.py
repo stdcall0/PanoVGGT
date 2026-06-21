@@ -33,6 +33,7 @@ from train_utils.general import *
 from train_utils.logging import setup_logging
 from train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 from train_utils.optimizer import construct_optimizers
+from train_utils.view_split import build_gs_view_split, select_source_views
 
 
 def _safe_barrier(local_rank: int):
@@ -669,7 +670,22 @@ class Trainer:
         return batch
 
     def _step(self, batch, model: nn.Module, phase: str, loss_meters: dict):
-        y_hat = model(images=batch["images"])
+        gs_view_split = build_gs_view_split(
+            batch=batch,
+            gs_conf=getattr(self.loss, "gs_conf", {}),
+            training=(phase == "train"),
+        )
+        model_batch = batch
+        if gs_view_split is not None:
+            source_idx, target_idx = gs_view_split
+            model_batch = select_source_views(batch, source_idx)
+
+        y_hat = model(images=model_batch["images"])
+        if "images" not in y_hat:
+            y_hat["images"] = model_batch["images"]
+        if gs_view_split is not None:
+            y_hat["gs_source_indices"] = source_idx
+            y_hat["gs_target_indices"] = target_idx
         loss_dict = self.loss(y_hat, batch)
 
         log_data = {**y_hat, **loss_dict, **batch}
