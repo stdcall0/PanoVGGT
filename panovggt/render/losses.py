@@ -76,6 +76,17 @@ def _masked_weighted_mean(
     return err.sum() / (weight_mask.sum() * err.shape[1] + eps)
 
 
+def _ssim_valid_window_mask(mask: torch.Tensor, window_size: int) -> torch.Tensor:
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    valid = (mask > 0).to(dtype=mask.dtype)
+    kernel = mask.new_ones(1, 1, window_size, window_size)
+    pad = window_size // 2
+    valid_count = F.conv2d(valid, kernel, padding=pad)
+    full_window = (valid_count >= window_size * window_size).to(dtype=mask.dtype)
+    return mask * full_window
+
+
 def masked_mse(
     pred: torch.Tensor,
     gt: torch.Tensor,
@@ -174,10 +185,14 @@ class GaussianRenderLoss(nn.Module):
         if self.ssim_weight > 0:
             ssim_map = ssim(rgb_pred, rgb_gt, window_size=self.ssim_window)
             if mask is not None:
-                if mask.dim() == ssim_map.dim() - 1:
-                    mask = mask.unsqueeze(1)
-                ssim_map = ssim_map * mask
-                ssim_loss = 1.0 - (ssim_map.sum() / (mask.sum() * ssim_map.shape[1] + 1e-6))
+                ssim_mask = _ssim_valid_window_mask(mask, self.ssim_window)
+                ssim_map = ssim_map * ssim_mask
+                denom = ssim_mask.sum() * ssim_map.shape[1]
+                ssim_loss = torch.where(
+                    denom > 1e-6,
+                    1.0 - (ssim_map.sum() / denom.clamp_min(1e-6)),
+                    ssim_map.new_zeros(()),
+                )
             else:
                 ssim_loss = 1.0 - ssim_map.mean()
             details["ssim"] = ssim_loss

@@ -49,6 +49,27 @@ def test_gaussian_render_loss_supports_masked_charbonnier():
     torch.testing.assert_close(details["rgb_charbonnier"], expected)
 
 
+def test_gaussian_render_loss_ssim_requires_fully_valid_window():
+    rgb_pred = torch.zeros(1, 3, 5, 5)
+    rgb_gt = torch.zeros_like(rgb_pred)
+    rgb_pred[:, :, 1:4, 1:4] = 1.0
+    rgb_pred[:, :, 2, 2] = 0.0
+    mask = torch.zeros(1, 1, 5, 5)
+    mask[:, :, 2, 2] = 1.0
+
+    loss_fn = GaussianRenderLoss(
+        rgb_weight=0.0,
+        ssim_weight=1.0,
+        depth_weight=0.0,
+        ssim_window=3,
+        rgb_loss_type="mse",
+    )
+    total, details = loss_fn(rgb_pred, rgb_gt, mask=mask)
+
+    torch.testing.assert_close(details["ssim"], torch.tensor(0.0))
+    torch.testing.assert_close(total, torch.tensor(0.0))
+
+
 def test_erp_solid_angle_weights_are_symmetric_and_downweight_poles():
     weights = erp_solid_angle_weights(4, device=torch.device("cpu"), dtype=torch.float32)
 
@@ -108,6 +129,7 @@ class _FakeBranch:
         self.world_points = None
         self.depth = None
         self.images = None
+        self.extra_out = {}
 
     def render(
         self,
@@ -132,12 +154,14 @@ class _FakeBranch:
         self.world_points = world_points.detach().clone()
         self.depth = depth.detach().clone() if depth is not None else None
         self.images = images.detach().clone()
-        return {
+        out = {
             "rgb_erp": torch.zeros(batch, targets, 3, height, width),
             "depth_erp": torch.zeros(batch, targets, 1, height, width),
             "alpha_erp": torch.ones(batch, targets, 1, height, width),
             "mask_erp": torch.ones(batch, targets, 1, height, width),
         }
+        out.update(self.extra_out)
+        return out
 
 
 class _CaptureRenderLoss(nn.Module):
@@ -197,6 +221,48 @@ def test_gaussian_loss_uses_separate_rgb_depth_and_source_masks():
     torch.testing.assert_close(fake_branch.point_masks.float(), source_gs_masks.float())
     torch.testing.assert_close(capture_loss.rgb_mask, rgb_masks.float().reshape(1, 1, 2, 2))
     torch.testing.assert_close(capture_loss.depth_mask, depth_masks.float().reshape(1, 1, 2, 2))
+
+
+def test_gaussian_loss_regularizers_use_patch_valid_mask():
+    loss = Loss(
+        train_conf=False,
+        gs={
+            "enabled": True,
+            "rgb_weight": 0.0,
+            "ssim_weight": 0.0,
+            "depth_weight": 0.0,
+            "offset_reg_weight": 1.0,
+            "scale_reg_weight": 1.0,
+            "scale_reg_target": 1.0,
+            "point_loss_weight": 0.0,
+            "camera_loss_weight": 0.0,
+        },
+    )
+    fake_branch = _FakeBranch()
+    fake_branch.extra_out = {
+        "offset_ratio": torch.tensor([[[[10.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]]),
+        "scale_mult": torch.tensor([[[[10.0, 10.0, 10.0], [1.0, 1.0, 1.0]]]]),
+        "patch_valid": torch.tensor([[[[0.0], [1.0]]]]),
+    }
+    loss.gs_branch = fake_branch
+    loss.gs_loss = _CaptureRenderLoss()
+    pred = {
+        "gs_world_points": torch.zeros(1, 1, 2, 2, 3),
+        "gs_camera_poses": _identity_poses(),
+        "depth": torch.ones(1, 1, 2, 2, 1),
+        "gaussian": _minimal_gaussian_params(),
+        "images": torch.zeros(1, 1, 3, 2, 2),
+    }
+    gt = {
+        "imgs": torch.zeros(1, 1, 3, 2, 2),
+        "depths": torch.ones(1, 1, 2, 2),
+        "valid_masks": torch.ones(1, 1, 2, 2, dtype=torch.bool),
+    }
+
+    _, details = loss._compute_gs_loss(pred, gt)
+
+    torch.testing.assert_close(details["offset_reg"], torch.tensor(0.0))
+    torch.testing.assert_close(details["scale_reg"], torch.tensor(0.0))
 
 
 def test_trainer_side_novel_view_split_uses_full_gt_target_only_as_target():

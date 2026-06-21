@@ -1276,18 +1276,38 @@ class Loss(nn.Module):
                 gs_total = gs_total + self._gs_front_floater_weight * front_floater
                 gs_details["total"] = gs_total
 
+        def gaussian_masked_mean(err: torch.Tensor, patch_valid: Optional[torch.Tensor]):
+            if patch_valid is None:
+                return err.mean()
+            weight = patch_valid.to(device=err.device, dtype=err.dtype)
+            if weight.dim() == err.dim() + 1 and weight.shape[-1] == 1:
+                weight = weight.squeeze(-1)
+            while weight.dim() < err.dim():
+                weight = weight.unsqueeze(-1)
+            weight = weight.expand_as(err)
+            denom = weight.sum()
+            return torch.where(
+                denom > 1e-6,
+                (err * weight).sum() / denom.clamp_min(1e-6),
+                err.new_zeros(()),
+            )
+
+        patch_valid = out.get("patch_valid", None)
         if self._gs_offset_reg_weight > 0.0:
             offset_ratio = out.get("offset_ratio", None)
             offset = out.get("offset", None)
             scale_init = out.get("scale_init", None)
             if offset_ratio is not None:
-                offset_reg = offset_ratio.norm(dim=-1).square().mean()
+                offset_reg = gaussian_masked_mean(offset_ratio.norm(dim=-1).square(), patch_valid)
                 gs_details["offset_reg"] = offset_reg
                 gs_total = gs_total + self._gs_offset_reg_weight * offset_reg
                 gs_details["total"] = gs_total
             elif offset is not None and scale_init is not None:
                 scale_ref = scale_init.detach().norm(dim=-1).clamp(min=1e-6)
-                offset_reg = (offset.norm(dim=-1) / scale_ref).square().mean()
+                offset_reg = gaussian_masked_mean(
+                    (offset.norm(dim=-1) / scale_ref).square(),
+                    patch_valid,
+                )
                 gs_details["offset_reg"] = offset_reg
                 gs_total = gs_total + self._gs_offset_reg_weight * offset_reg
                 gs_details["total"] = gs_total
@@ -1296,7 +1316,10 @@ class Loss(nn.Module):
             scale_mult = out.get("scale_mult", None)
             if scale_mult is not None:
                 target = scale_mult.new_tensor(self._gs_scale_reg_target).clamp_min(1e-6)
-                scale_reg = torch.log(scale_mult.clamp_min(1e-6) / target).square().mean()
+                scale_reg = gaussian_masked_mean(
+                    torch.log(scale_mult.clamp_min(1e-6) / target).square(),
+                    patch_valid,
+                )
                 gs_details["scale_reg"] = scale_reg
                 gs_total = gs_total + self._gs_scale_reg_weight * scale_reg
                 gs_details["total"] = gs_total
