@@ -283,3 +283,57 @@ def test_aggregate_predictions_flattens_2x2_subgrid_gaussians():
     )
 
     assert agg["means"].shape == (4, 3)
+
+
+class _RecordingRenderer:
+    equ_h = 4
+
+    def __init__(self):
+        self.calls = []
+
+    def render(self, means, quats, scales, opacities, colors_sh, w2c_per_view):
+        self.calls.append(
+            {
+                "means_shape": tuple(means.shape),
+                "quats_shape": tuple(quats.shape),
+                "scales_shape": tuple(scales.shape),
+                "opacities_shape": tuple(opacities.shape),
+                "colors_shape": tuple(colors_sh.shape),
+                "views": int(w2c_per_view.shape[0]),
+            }
+        )
+        views = w2c_per_view.shape[0]
+        return {
+            "rgb_erp": torch.zeros(views, 3, 4, 8),
+            "depth_erp": torch.zeros(views, 1, 4, 8),
+            "alpha_erp": torch.ones(views, 1, 4, 8),
+            "mask_erp": torch.ones(views, 1, 4, 8),
+        }
+
+
+def test_render_flattens_2x2_subgrid_gaussians_per_batch():
+    branch = _make_branch()
+    branch.renderer = _RecordingRenderer()
+    gs_params = _make_gs_params(batch=2, views=1, patch_h=1, patch_w=1, subgrid_size=2)
+    world_points = torch.zeros(2, 1, 4, 4, 3)
+    images = torch.zeros(2, 1, 3, 4, 4)
+    camera_poses = torch.eye(4).view(1, 1, 4, 4).expand(2, 1, 4, 4).clone()
+
+    out = branch.render(
+        gs_params=gs_params,
+        world_points=world_points,
+        camera_poses_c2w=camera_poses,
+        images=images,
+    )
+
+    assert len(branch.renderer.calls) == 2
+    assert branch.renderer.calls[0] == {
+        "means_shape": (4, 3),
+        "quats_shape": (4, 4),
+        "scales_shape": (4, 3),
+        "opacities_shape": (4,),
+        "colors_shape": (4, 4, 3),
+        "views": 1,
+    }
+    assert branch.renderer.calls[1] == branch.renderer.calls[0]
+    assert out["rgb_erp"].shape == (2, 1, 3, 4, 8)
