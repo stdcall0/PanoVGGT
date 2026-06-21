@@ -38,6 +38,7 @@ loss:
     scale_init_mode: depth_footprint
     scale_init_value: 0.01
     min_valid_ratio: 0.25
+    offset_max_ratio: 0.5
     use_offset: True
     detach_centers: True
     detach_camera: True

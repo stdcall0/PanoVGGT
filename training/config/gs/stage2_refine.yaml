@@ -24,6 +24,7 @@ loss:
     scale_mult_max: 1.25
     scale_reg_weight: 0.005
     scale_reg_target: 1.0
+    offset_max_ratio: 0.35
     use_offset: True
     train_dc: True
     train_opacity: True

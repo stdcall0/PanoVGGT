@@ -65,6 +65,7 @@ class GSBranch:
         scale_init_factor: float = 1.0,
         scale_mult_min: Optional[float] = None,
         scale_mult_max: Optional[float] = None,
+        offset_max_ratio: float = 0.5,
         use_offset: bool = False,
         detach_centers: bool = True,
         detach_camera: bool = True,
@@ -83,6 +84,7 @@ class GSBranch:
         self.scale_init_factor = float(scale_init_factor)
         self.scale_mult_min = scale_mult_min
         self.scale_mult_max = scale_mult_max
+        self.offset_max_ratio = float(offset_max_ratio)
         self.use_offset = use_offset
         self.detach_centers = detach_centers
         self.detach_camera = detach_camera
@@ -145,13 +147,6 @@ class GSBranch:
         if self.detach_centers:
             centers_pp = centers_pp.detach()
 
-        if self.use_offset and self.train_flags["offset"]:
-            offset = gs_params["offset"]
-            centers = centers_pp + offset
-        else:
-            offset = torch.zeros_like(centers_pp)
-            centers = centers_pp
-
         # ---- color init ---------------------------------------------------
         # patch-pool the GT image to get a per-Gaussian DC bootstrap.
         img_pp = patch_pool(images, patch_size)              # (B,S,3,Hp,Wp)
@@ -193,6 +188,19 @@ class GSBranch:
             scale_mult = torch.ones_like(scale_init)
             scale_final = scale_init.detach()
 
+        # ---- offset -------------------------------------------------------
+        # Interpret the head output as a local offset ratio rather than an
+        # absolute world-space displacement. Binding it to scale_init prevents
+        # offset freedom from silently growing when learned scales grow.
+        if self.use_offset and self.train_flags["offset"]:
+            offset_ratio = torch.tanh(gs_params["offset"]) * self.offset_max_ratio
+            offset = offset_ratio * scale_init.detach()
+            centers = centers_pp + offset
+        else:
+            offset_ratio = torch.zeros_like(centers_pp)
+            offset = torch.zeros_like(centers_pp)
+            centers = centers_pp
+
         # rotation
         if self.train_flags["rotation"]:
             rotation_final = gs_params["rotation"]
@@ -227,6 +235,7 @@ class GSBranch:
         return dict(
             centers=centers,
             offset=offset,
+            offset_ratio=offset_ratio,
             scales=scale_final,
             scale_init=scale_init,
             scale_mult=scale_mult,
@@ -304,6 +313,7 @@ class GSBranch:
             mask_erp=torch.stack(out_mask, dim=0),
             centers=centers,
             offset=offset,
+            offset_ratio=materialized.get("offset_ratio"),
             scales=scale_final,
             scale_init=scale_init,
             scale_mult=scale_mult,
@@ -334,6 +344,7 @@ def materialize_gaussians(
     branch.scale_init_factor = float(gs_conf.get("scale_init_factor", 1.0))
     branch.scale_mult_min = gs_conf.get("scale_mult_min", None)
     branch.scale_mult_max = gs_conf.get("scale_mult_max", None)
+    branch.offset_max_ratio = float(gs_conf.get("offset_max_ratio", 0.5))
     branch.use_offset = bool(gs_conf.get("use_offset", False))
     branch.detach_centers = bool(gs_conf.get("detach_centers", True))
     branch.detach_camera = bool(gs_conf.get("detach_camera", True))

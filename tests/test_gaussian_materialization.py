@@ -12,6 +12,7 @@ def _make_branch(**overrides):
     branch.scale_init_factor = 1.0
     branch.scale_mult_min = None
     branch.scale_mult_max = None
+    branch.offset_max_ratio = 0.5
     branch.use_offset = False
     branch.detach_centers = True
     branch.detach_camera = True
@@ -180,3 +181,33 @@ def test_smooth_bounded_scale_keeps_gradients_near_upper_bound():
 
     assert out["scale_mult"].max().item() < 1.25
     assert gs_params["scale"].grad.abs().sum().item() > 0.0
+
+
+def test_scale_relative_offset_starts_at_zero():
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    branch = _make_branch(use_offset=True)
+    branch.train_flags["offset"] = True
+
+    out = branch.materialize(gs_params, world_points, images)
+
+    torch.testing.assert_close(out["offset"], torch.zeros_like(out["offset"]))
+    torch.testing.assert_close(out["offset_ratio"], torch.zeros_like(out["offset_ratio"]))
+
+
+def test_scale_relative_offset_is_bounded_and_keeps_gradients():
+    gs_params = _make_gs_params()
+    gs_params["offset"] = torch.full_like(gs_params["offset"], 3.0)
+    gs_params["offset"].requires_grad_()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    branch = _make_branch(use_offset=True, offset_max_ratio=0.5)
+    branch.train_flags["offset"] = True
+
+    out = branch.materialize(gs_params, world_points, images)
+    out["offset"].sum().backward()
+
+    assert out["offset"].abs().max().item() < 0.005
+    assert out["offset_ratio"].abs().max().item() < 0.5
+    assert gs_params["offset"].grad.abs().sum().item() > 0.0

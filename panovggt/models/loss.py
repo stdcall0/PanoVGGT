@@ -870,6 +870,7 @@ class Loss(nn.Module):
             scale_init_factor=float(gs_conf.get("scale_init_factor", 1.0)),
             scale_mult_min=gs_conf.get("scale_mult_min", None),
             scale_mult_max=gs_conf.get("scale_mult_max", None),
+            offset_max_ratio=float(gs_conf.get("offset_max_ratio", 0.5)),
             use_offset=bool(gs_conf.get("use_offset", False)),
             detach_centers=bool(gs_conf.get("detach_centers", True)),
             detach_camera=bool(gs_conf.get("detach_camera", True)),
@@ -1201,9 +1202,15 @@ class Loss(nn.Module):
                 gs_details["total"] = gs_total
 
         if self._gs_offset_reg_weight > 0.0:
+            offset_ratio = out.get("offset_ratio", None)
             offset = out.get("offset", None)
             scale_init = out.get("scale_init", None)
-            if offset is not None and scale_init is not None:
+            if offset_ratio is not None:
+                offset_reg = offset_ratio.norm(dim=-1).square().mean()
+                gs_details["offset_reg"] = offset_reg
+                gs_total = gs_total + self._gs_offset_reg_weight * offset_reg
+                gs_details["total"] = gs_total
+            elif offset is not None and scale_init is not None:
                 scale_ref = scale_init.detach().norm(dim=-1).clamp(min=1e-6)
                 offset_reg = (offset.norm(dim=-1) / scale_ref).square().mean()
                 gs_details["offset_reg"] = offset_reg

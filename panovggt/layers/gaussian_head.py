@@ -21,13 +21,6 @@ def _softplus_inv(y: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return torch.log(torch.expm1(y.clamp_min(eps)) + eps)
 
 
-def reg_dense_offsets(xyz: torch.Tensor, shift: float = 6.0) -> torch.Tensor:
-    """Splatt3R/PixelSplat offset activation (small near init, monotone in d)."""
-    d = xyz.norm(dim=-1, keepdim=True).clamp_min(1e-8)
-    direction = xyz / d
-    return direction * (torch.exp(d - shift) - math.exp(-shift))
-
-
 def _init_linear(layer: nn.Linear, weight_scale: float, bias: float, bias_vec=None):
     if weight_scale > 0:
         nn.init.uniform_(layer.weight, -weight_scale, weight_scale)
@@ -117,14 +110,13 @@ class LinearGaussianHead(nn.Module):
         else:
             sh_rest = dc_raw.new_zeros(B, S, Hp, Wp, 3, 0)
 
-        offset = reg_dense_offsets(offset_raw)
         scale = F.softplus(scale_raw) + 1e-6
         rotation = rot_raw / (rot_raw.norm(dim=-1, keepdim=True) + 1e-8)
         opacity = torch.sigmoid(opacity_raw)
         sh_dc = dc_raw
 
         return dict(
-            offset=offset,
+            offset=offset_raw,
             scale=scale,
             rotation=rotation,
             opacity=opacity,
