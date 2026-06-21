@@ -1,6 +1,6 @@
 import torch
 
-from panovggt.render.gs_branch import GSBranch
+from panovggt.render.gs_branch import GSBranch, materialize_gaussians
 
 
 def _make_branch(**overrides):
@@ -81,3 +81,72 @@ def test_materialize_freezes_rotation_to_identity_when_not_trainable():
     expected = torch.zeros(1, 1, 2, 2, 4)
     expected[..., 0] = 1.0
     torch.testing.assert_close(out["rotations"], expected)
+
+
+def test_free_materialize_matches_branch_masking_contract():
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.full((1, 1, 3, 4, 4), 0.25)
+    point_masks = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    point_masks[..., :2, :2] = False
+    gs_conf = {
+        "renderer": "cube",
+        "scale_init_mode": "constant",
+        "scale_init_value": 0.01,
+        "min_valid_ratio": 0.25,
+        "train_dc": True,
+        "train_opacity": True,
+        "train_scale": False,
+        "train_rotation": False,
+        "train_sh_rest": False,
+        "use_offset": False,
+    }
+
+    branch_out = _make_branch().materialize(
+        gs_params=gs_params,
+        world_points=world_points,
+        images=images,
+        depth=None,
+        point_masks=point_masks,
+    )
+    free_out = materialize_gaussians(
+        gs_params=gs_params,
+        world_points=world_points,
+        images=images,
+        depth=None,
+        gs_conf=gs_conf,
+        sh_degree=1,
+        point_masks=point_masks,
+    )
+
+    torch.testing.assert_close(free_out["opacities"], branch_out["opacities"])
+    torch.testing.assert_close(free_out["patch_valid"], branch_out["patch_valid"])
+
+
+def test_aggregate_predictions_passes_point_masks_to_materialization():
+    from panovggt.utils.gs_export import aggregate_predictions
+
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    point_masks = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    point_masks[..., :2, :2] = False
+
+    agg = aggregate_predictions(
+        {
+            "gaussian": gs_params,
+            "world_points": world_points,
+            "images": images,
+            "point_masks": point_masks,
+        },
+        sh_degree=1,
+        gs_conf={
+            "scale_init_mode": "constant",
+            "scale_init_value": 0.01,
+            "min_valid_ratio": 0.25,
+            "train_opacity": True,
+        },
+    )
+
+    assert agg["opacities"][0].item() == 0.0
+    assert agg["opacities"][-1].item() == 1.0

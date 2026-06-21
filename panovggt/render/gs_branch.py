@@ -293,6 +293,7 @@ def materialize_gaussians(
     depth: Optional[torch.Tensor],
     gs_conf: Dict,
     sh_degree: int,
+    point_masks: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the exact Gaussian tensors used by GSBranch.render for export/tests."""
     branch = object.__new__(GSBranch)
@@ -316,4 +317,10 @@ def materialize_gaussians(
         offset=bool(gs_conf.get("use_offset", False)),
     )
     branch.min_valid_ratio = float(gs_conf.get("min_valid_ratio", 0.25))
-    return branch.materialize(gs_params, world_points, images, depth)
+    return branch.materialize(
+        gs_params=gs_params,
+        world_points=world_points,
+        images=images,
+        depth=depth,
+        point_masks=point_masks,
+    )

@@ -60,6 +60,18 @@ def ensure_batched_map_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
     raise ValueError(f"unexpected tensor shape for {name}: {tuple(x.shape)}")
 
 
+def ensure_batched_mask_tensor(x: Optional[torch.Tensor], name: str) -> Optional[torch.Tensor]:
+    if x is None:
+        return None
+    if x.dim() == 3:
+        return x.unsqueeze(0)
+    if x.dim() == 4:
+        return x
+    if x.dim() == 5 and x.shape[-1] == 1:
+        return x[..., 0]
+    raise ValueError(f"unexpected mask tensor shape for {name}: {tuple(x.shape)}")
+
+
 def ensure_batched_pose_tensor(x: torch.Tensor, name: str) -> torch.Tensor:
     if x is None:
         raise ValueError(f"missing required tensor for {name}")
@@ -524,6 +536,13 @@ def main(args: argparse.Namespace) -> None:
 
     print(f"[pipeline] Inference frame size: {H} × {W}")
 
+    loaded_masks: Optional[List[Optional[np.ndarray]]] = None
+    if mask_paths is not None:
+        loaded_masks = [
+            load_mask(mask_path, H, W) if mask_path is not None else None
+            for mask_path in mask_paths
+        ]
+
     # ── per-frame processing ──────────────────────────────────────────────
     all_xyz: List[np.ndarray] = []
     all_rgb: List[np.ndarray] = []
@@ -542,8 +561,8 @@ def main(args: argparse.Namespace) -> None:
 
         # Load and resize mask to inference resolution
         mask_valid: Optional[np.ndarray] = None
-        if mask_paths is not None and mask_paths[i] is not None:
-            mask_valid = load_mask(mask_paths[i], H, W)
+        if loaded_masks is not None and mask_paths is not None and mask_paths[i] is not None:
+            mask_valid = loaded_masks[i]
             if mask_valid is not None:
                 print(f"  mask: {mask_paths[i]}  "
                       f"valid={mask_valid.sum():,}/{H * W:,} px "
@@ -642,10 +661,18 @@ def main(args: argparse.Namespace) -> None:
         poses_t = torch.from_numpy(camera_poses_for_gs) if isinstance(camera_poses_for_gs, np.ndarray) else camera_poses_for_gs
         images_t = torch.from_numpy(images_for_gs) if isinstance(images_for_gs, np.ndarray) else images_for_gs
         depth_t = torch.from_numpy(depth_for_gs) if isinstance(depth_for_gs, np.ndarray) else depth_for_gs
+        point_masks_t = None
+        if loaded_masks is not None:
+            export_masks = [
+                mask if mask is not None else np.ones((H, W), dtype=bool)
+                for mask in loaded_masks
+            ]
+            point_masks_t = torch.from_numpy(np.stack(export_masks, axis=0))
         wp_t = ensure_batched_map_tensor(wp_t, "world_points")
         local_t = ensure_batched_map_tensor(local_t, "local_points")
         poses_t = ensure_batched_pose_tensor(poses_t, "camera_poses")
         images_t = ensure_batched_map_tensor(images_t, "images")
+        point_masks_t = ensure_batched_mask_tensor(point_masks_t, "point_masks")
         if depth_t is not None:
             depth_t = ensure_batched_map_tensor(depth_t, "depth")
         wp_t, depth_t, norm_factor = normalize_gs_export_frame(
@@ -666,6 +693,7 @@ def main(args: argparse.Namespace) -> None:
             "world_points": wp_t,
             "images": images_t,
             "depth": depth_t,
+            "point_masks": point_masks_t,
         }
         from panovggt.utils.gs_export import aggregate_predictions, gs_to_ply
         gs_conf = load_gs_conf(args.config)

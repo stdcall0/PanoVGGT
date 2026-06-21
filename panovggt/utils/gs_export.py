@@ -83,6 +83,9 @@ def aggregate_predictions(
 
     gs_conf = gs_conf or {}
     depth = pred.get("depth", None)
+    point_masks = pred.get("point_masks", None)
+    if point_masks is None:
+        point_masks = pred.get("valid_masks", None)
     materialized = materialize_gaussians(
         gs_params=g,
         world_points=pred["world_points"],
@@ -90,6 +93,7 @@ def aggregate_predictions(
         depth=depth,
         gs_conf=gs_conf,
         sh_degree=sh_degree,
+        point_masks=point_masks,
     )
 
     means = materialized["centers"].reshape(-1, 3)
