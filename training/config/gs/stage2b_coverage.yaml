@@ -15,7 +15,9 @@ loss:
   gs:
     photometric_mode: source_recon
     self_recon: False
-    rgb_loss_type: mse
+    rgb_loss_type: charbonnier
+    charbonnier_eps: 0.001
+    solid_angle_weight: True
     ssim_weight: 0.001
     depth_weight: 0.0
     scale_init_factor: 0.75

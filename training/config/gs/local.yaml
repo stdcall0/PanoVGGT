@@ -46,6 +46,9 @@ loss:
     train_scale: True
     train_rotation: False
     train_sh_rest: False
+    rgb_loss_type: charbonnier
+    charbonnier_eps: 0.001
+    solid_angle_weight: True
     rgb_weight: 1.0
     ssim_weight: 0.0
     depth_weight: 0.0

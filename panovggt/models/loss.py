@@ -605,6 +605,8 @@ class Loss(nn.Module):
                 ssim_weight=float(self.gs_conf.get("ssim_weight", 0.2)),
                 depth_weight=float(self.gs_conf.get("depth_weight", 0.0)),
                 rgb_loss_type=str(self.gs_conf.get("rgb_loss_type", "l1")),
+                charbonnier_eps=float(self.gs_conf.get("charbonnier_eps", 1e-3)),
+                solid_angle_weight=bool(self.gs_conf.get("solid_angle_weight", False)),
             )
         self._gs_loss_weight = float(self.gs_conf.get("loss_weight", 1.0))
         self._point_loss_weight = float(self.gs_conf.get("point_loss_weight", 1.0))

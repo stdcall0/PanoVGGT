@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 
 from panovggt.models.loss import Loss
-from panovggt.render.losses import GaussianRenderLoss
+from panovggt.render.losses import (
+    GaussianRenderLoss,
+    erp_solid_angle_weights,
+)
 
 
 def test_gaussian_render_loss_normalizes_mask_by_visible_pixels_and_channels():
@@ -23,6 +26,36 @@ def test_gaussian_render_loss_normalizes_mask_by_visible_pixels_and_channels():
     torch.testing.assert_close(total, torch.tensor(4.0))
     torch.testing.assert_close(details["rgb_loss"], torch.tensor(4.0))
     torch.testing.assert_close(details["rgb_mse"], torch.tensor(4.0))
+
+
+def test_gaussian_render_loss_supports_masked_charbonnier():
+    rgb_pred = torch.zeros(1, 3, 2, 2)
+    rgb_gt = torch.zeros_like(rgb_pred)
+    rgb_gt[:, :, 0, 1] = 2.0
+    mask = torch.zeros(1, 1, 2, 2)
+    mask[:, :, 0, 1] = 1.0
+
+    loss_fn = GaussianRenderLoss(
+        rgb_weight=1.0,
+        ssim_weight=0.0,
+        depth_weight=0.0,
+        rgb_loss_type="charbonnier",
+        charbonnier_eps=0.1,
+    )
+    total, details = loss_fn(rgb_pred, rgb_gt, mask=mask)
+
+    expected = torch.sqrt(torch.tensor(4.0 + 0.01)) - 0.1
+    torch.testing.assert_close(total, expected)
+    torch.testing.assert_close(details["rgb_charbonnier"], expected)
+
+
+def test_erp_solid_angle_weights_are_symmetric_and_downweight_poles():
+    weights = erp_solid_angle_weights(4, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert weights.shape == (1, 1, 4, 1)
+    torch.testing.assert_close(weights[..., 0, :], weights[..., -1, :])
+    torch.testing.assert_close(weights[..., 1, :], weights[..., 2, :])
+    assert weights[..., 0, :].item() < weights[..., 1, :].item()
 
 
 def test_combined_loss_initializes_gaussian_branch_loss_without_trainer():

@@ -50,28 +50,65 @@ def ssim(
     return num / den
 
 
-def masked_l1(
-    pred: torch.Tensor, gt: torch.Tensor, mask: Optional[torch.Tensor] = None, eps: float = 1e-6
+def erp_solid_angle_weights(height: int, device, dtype) -> torch.Tensor:
+    """ERP row weights proportional to per-pixel solid angle."""
+    rows = torch.arange(height, device=device, dtype=dtype) + 0.5
+    phi = (rows / height - 0.5) * torch.pi
+    return torch.cos(phi).clamp_min(0.0).view(1, 1, height, 1)
+
+
+def _masked_weighted_mean(
+    err: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
-    err = (pred - gt).abs()
-    if mask is None:
+    if mask is None and weight is None:
         return err.mean()
-    if mask.dim() == err.dim() - 1:
-        mask = mask.unsqueeze(1)
-    err = err * mask
-    return err.sum() / (mask.sum() * pred.shape[1] + eps)
+    weight_mask = torch.ones_like(err[:, :1])
+    if mask is not None:
+        if mask.dim() == err.dim() - 1:
+            mask = mask.unsqueeze(1)
+        weight_mask = weight_mask * mask
+    if weight is not None:
+        weight_mask = weight_mask * weight
+    err = err * weight_mask
+    return err.sum() / (weight_mask.sum() * err.shape[1] + eps)
 
 
 def masked_mse(
-    pred: torch.Tensor, gt: torch.Tensor, mask: Optional[torch.Tensor] = None, eps: float = 1e-6
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     err = (pred - gt).square()
-    if mask is None:
-        return err.mean()
-    if mask.dim() == err.dim() - 1:
-        mask = mask.unsqueeze(1)
-    err = err * mask
-    return err.sum() / (mask.sum() * pred.shape[1] + eps)
+    return _masked_weighted_mean(err, mask=mask, weight=weight, eps=eps)
+
+
+def masked_l1(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    err = (pred - gt).abs()
+    return _masked_weighted_mean(err, mask=mask, weight=weight, eps=eps)
+
+
+def masked_charbonnier(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    charbonnier_eps: float = 1e-3,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    residual = pred - gt
+    err = torch.sqrt(residual.square() + charbonnier_eps ** 2) - charbonnier_eps
+    return _masked_weighted_mean(err, mask=mask, weight=weight, eps=eps)
 
 
 class GaussianRenderLoss(nn.Module):
@@ -84,6 +121,8 @@ class GaussianRenderLoss(nn.Module):
         depth_weight: float = 0.0,
         ssim_window: int = 11,
         rgb_loss_type: str = "l1",
+        charbonnier_eps: float = 1e-3,
+        solid_angle_weight: bool = False,
     ):
         super().__init__()
         self.rgb_weight = rgb_weight
@@ -91,9 +130,12 @@ class GaussianRenderLoss(nn.Module):
         self.depth_weight = depth_weight
         self.ssim_window = ssim_window
         self.rgb_loss_type = rgb_loss_type.lower()
-        if self.rgb_loss_type not in ("l1", "mse", "l2"):
+        self.charbonnier_eps = float(charbonnier_eps)
+        self.solid_angle_weight = bool(solid_angle_weight)
+        if self.rgb_loss_type not in ("l1", "mse", "l2", "charbonnier"):
             raise ValueError(
-                f"Unsupported rgb_loss_type '{rgb_loss_type}'. Use 'l1' or 'mse'."
+                f"Unsupported rgb_loss_type '{rgb_loss_type}'. "
+                "Use 'l1', 'mse', or 'charbonnier'."
             )
 
     def forward(
@@ -106,12 +148,26 @@ class GaussianRenderLoss(nn.Module):
         depth_mask: Optional[torch.Tensor] = None,
     ):
         details = {}
+        weight = None
+        if self.solid_angle_weight:
+            weight = erp_solid_angle_weights(
+                rgb_pred.shape[-2], device=rgb_pred.device, dtype=rgb_pred.dtype
+            )
         if self.rgb_loss_type == "l1":
-            rgb_loss = masked_l1(rgb_pred, rgb_gt, mask)
+            rgb_loss = masked_l1(rgb_pred, rgb_gt, mask, weight=weight)
             details["rgb_l1"] = rgb_loss
-        else:
-            rgb_loss = masked_mse(rgb_pred, rgb_gt, mask)
+        elif self.rgb_loss_type in ("mse", "l2"):
+            rgb_loss = masked_mse(rgb_pred, rgb_gt, mask, weight=weight)
             details["rgb_mse"] = rgb_loss
+        else:
+            rgb_loss = masked_charbonnier(
+                rgb_pred,
+                rgb_gt,
+                mask,
+                weight=weight,
+                charbonnier_eps=self.charbonnier_eps,
+            )
+            details["rgb_charbonnier"] = rgb_loss
         details["rgb_loss"] = rgb_loss
         total = self.rgb_weight * rgb_loss
 
