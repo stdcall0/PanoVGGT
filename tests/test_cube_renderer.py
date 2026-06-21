@@ -1,6 +1,11 @@
+import builtins
+import sys
+import types
+
 import torch
 import torch.nn as nn
 
+from panovggt.render import cube_renderer
 from panovggt.render.cube_renderer import CubePanoRenderer
 from panovggt.render.cube_to_equi import Cube2Equirec
 
@@ -150,3 +155,31 @@ def test_cube_renderer_reuses_static_tensors_for_same_device_and_dtype():
     assert K1.data_ptr() == K2.data_ptr()
     assert ray1.data_ptr() == ray2.data_ptr()
     assert mask1.data_ptr() == mask2.data_ptr()
+
+
+def test_gsplat_backend_loader_falls_back_when_fcntl_is_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setattr(cube_renderer, "_GSPLAT_BACKEND_READY", False)
+    monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path))
+
+    gsplat_module = types.ModuleType("gsplat")
+    cuda_module = types.ModuleType("gsplat.cuda")
+    cuda_module._backend = object()
+    gsplat_module.cuda = cuda_module
+    monkeypatch.setitem(sys.modules, "gsplat", gsplat_module)
+    monkeypatch.setitem(sys.modules, "gsplat.cuda", cuda_module)
+
+    real_import = builtins.__import__
+    import_attempts = []
+
+    def import_without_fcntl(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fcntl":
+            import_attempts.append(name)
+            raise ImportError("No module named fcntl")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_fcntl)
+
+    cube_renderer._ensure_gsplat_backend_loaded_once()
+
+    assert import_attempts == ["fcntl"]
+    assert cube_renderer._GSPLAT_BACKEND_READY is True

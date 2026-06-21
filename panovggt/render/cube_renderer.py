@@ -29,22 +29,27 @@ def _ensure_gsplat_backend_loaded_once() -> None:
     if _GSPLAT_BACKEND_READY:
         return
 
+    try:
+        import fcntl
+    except ImportError:
+        from gsplat.cuda import _backend  # noqa: F401
+        _GSPLAT_BACKEND_READY = True
+        return
+
     lock_root = os.environ.get("TORCH_EXTENSIONS_DIR") or "/tmp"
     os.makedirs(lock_root, exist_ok=True)
     lock_path = os.path.join(lock_root, "gsplat_cuda_jit.lock")
 
     try:
-        import fcntl
-
         with open(lock_path, "w") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            from gsplat.cuda import _backend  # noqa: F401
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    except ImportError:
-        raise
+            try:
+                from gsplat.cuda import _backend  # noqa: F401
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     except Exception:
-        # Non-POSIX fallback or lock-file edge case; let gsplat surface the
-        # real import/JIT error if this still fails.
+        # Lock-file edge case; let gsplat surface the real import/JIT error if
+        # this still fails.
         from gsplat.cuda import _backend  # noqa: F401
 
     _GSPLAT_BACKEND_READY = True
