@@ -137,11 +137,16 @@ class Cube2Equirec(nn.Module):
         assert F_ == 6, f"expected 6 faces, got {F_}"
         # grid_sample 3-D expects (N, C, D_in, H_in, W_in) and grid (N, D_out, H_out, W_out, 3)
         # we map D_out=1, H_out=equ_h, W_out=equ_w.
-        grid = self.grid.expand(B, 1, self.equ_h, self.equ_w, 3)
+        grid = self.grid.to(device=cube.device, dtype=cube.dtype).expand(
+            B, 1, self.equ_h, self.equ_w, 3
+        )
         out = F.grid_sample(
             cube, grid, mode="bilinear", padding_mode="border", align_corners=True
         )
         return out.squeeze(2)  # drop D_out=1 → (B, C, equ_h, equ_w)
 
-    def get_valid_mask(self, batch_size: int = 1) -> torch.Tensor:
-        return self.valid_mask.expand(batch_size, 1, self.equ_h, self.equ_w).contiguous()
+    def get_valid_mask(self, batch_size: int = 1, device=None, dtype=None) -> torch.Tensor:
+        mask = self.valid_mask
+        if device is not None or dtype is not None:
+            mask = mask.to(device=device, dtype=dtype)
+        return mask.expand(batch_size, 1, self.equ_h, self.equ_w).contiguous()

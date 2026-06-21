@@ -240,10 +240,6 @@ class CubePanoRenderer(nn.Module):
         face_w2c_all = torch.cat(face_w2c_all, dim=0)                    # (6V,4,4)
 
         bg = None
-        if self.bg_color is not None and float(self.bg_color) != 0.0:
-            bg = torch.full(
-                (6 * V, 3), float(self.bg_color), device=device, dtype=dtype
-            )
 
         rasterization = self._load_rasterization()
         rgb, alpha, _info = rasterization(
@@ -287,6 +283,9 @@ class CubePanoRenderer(nn.Module):
         rgb_erp = self.cube2equi(rgb_cube)
         depth_moment_erp = self.cube2equi(depth_moment_cube)
         alpha_erp = self.cube2equi(alpha_cube)
+        if self.bg_color is not None and float(self.bg_color) != 0.0:
+            bg_value = rgb_erp.new_tensor(float(self.bg_color))
+            rgb_erp = rgb_erp + (1.0 - alpha_erp.clamp(0.0, 1.0)) * bg_value
         depth_erp = torch.where(
             alpha_erp > 1e-6,
             depth_moment_erp / alpha_erp.clamp_min(1e-6),

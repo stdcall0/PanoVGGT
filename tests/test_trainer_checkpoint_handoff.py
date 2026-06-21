@@ -101,3 +101,25 @@ def test_model_init_checkpoint_does_not_restore_training_state(tmp_path):
     assert trainer.epoch == 0
     assert trainer.steps == {"train": 0, "val": 0}
     assert trainer.ckpt_time_elapsed == 0
+
+
+def test_batch_repetition_repeats_all_gs_mask_keys():
+    trainer = object.__new__(Trainer)
+    batch = {
+        "images": torch.zeros(1, 2, 3, 1, 1),
+        "depths": torch.zeros(1, 2, 1, 1),
+        "extrinsics": torch.eye(4).view(1, 1, 4, 4).expand(1, 2, 4, 4).clone(),
+        "intrinsics": torch.eye(3).view(1, 1, 3, 3).expand(1, 2, 3, 3).clone(),
+        "cam_points": torch.zeros(1, 2, 1, 1, 3),
+        "world_points": torch.zeros(1, 2, 1, 1, 3),
+        "point_masks": torch.tensor([[[[True]], [[False]]]]),
+        "rgb_masks": torch.tensor([[[[True]], [[False]]]]),
+        "depth_masks": torch.tensor([[[[False]], [[True]]]]),
+        "source_gs_masks": torch.tensor([[[[True]], [[False]]]]),
+    }
+
+    repeated = trainer._apply_batch_repetition(batch)
+
+    for key in ("point_masks", "rgb_masks", "depth_masks", "source_gs_masks"):
+        assert repeated[key].shape[0] == 2
+        torch.testing.assert_close(repeated[key][1], torch.flip(repeated[key][0:1], dims=[1])[0])

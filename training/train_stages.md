@@ -14,10 +14,13 @@ This is the compact training map for the 3DGS head. The active configs keep
   state.
 - `resume_checkpoint_path` is only for continuing an interrupted run of the same
   stage. Keep previous-stage checkpoints out of `resume_checkpoint_path`.
+- Auto-resume checks the stage `save_dir` before `init_checkpoint_path`. To
+  restart a stage from the handoff checkpoint, delete, move, or change that
+  stage's output directory first.
 
 ## Stages
 
-| Stage | Config | Trainable GS Parameters | Resume Source |
+| Stage | Config | Trainable GS Parameters | Init/Handoff Source |
 | --- | --- | --- | --- |
 | 1 bootstrap | `training/config/gs/stage1_bootstrap.yaml` | `sh_dc`, `opacity` | base PanoVGGT checkpoint |
 | 2 refine | `training/config/gs/stage2_refine.yaml` | `sh_dc`, `opacity`, bounded `scale`, bounded `offset` | Stage 1 |

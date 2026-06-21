@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from panovggt.render.cube_renderer import CubePanoRenderer
+from panovggt.render.cube_to_equi import Cube2Equirec
 
 
 class _SumFacesCubeToEqui(nn.Module):
@@ -12,14 +13,14 @@ class _SumFacesCubeToEqui(nn.Module):
         return torch.ones(views, 1, 1, 1)
 
 
-def test_cube_renderer_passes_background_and_normalizes_depth_moment_after_projection():
+def test_cube_renderer_normalizes_depth_moment_after_projection():
     renderer = CubePanoRenderer(
         equ_h=1,
         face_res=1,
         fov_deg=90.0,
         boundary_px=0,
         sh_degree=1,
-        bg_color=0.25,
+        bg_color=None,
     )
     renderer.cube2equi = _SumFacesCubeToEqui()
     calls = {}
@@ -45,9 +46,45 @@ def test_cube_renderer_passes_background_and_normalizes_depth_moment_after_proje
     )
 
     assert calls["render_mode"] == "RGB+D"
-    torch.testing.assert_close(calls["backgrounds"], torch.full((6, 3), 0.25))
+    assert calls["backgrounds"] is None
     torch.testing.assert_close(out["alpha_erp"], torch.full((1, 1, 1, 1), 2.0))
     torch.testing.assert_close(out["depth_erp"], torch.full((1, 1, 1, 1), 3.0))
+
+
+def test_cube_renderer_post_composites_nonzero_background_for_packed_rgbd():
+    renderer = CubePanoRenderer(
+        equ_h=1,
+        face_res=1,
+        fov_deg=90.0,
+        boundary_px=0,
+        sh_degree=1,
+        bg_color=0.25,
+    )
+    renderer.cube2equi = _SumFacesCubeToEqui()
+    calls = {}
+
+    def fake_rasterization(**kwargs):
+        calls.update(kwargs)
+        rgb_depth = torch.zeros(6, 1, 1, 4)
+        alpha = torch.zeros(6, 1, 1, 1)
+        alpha[0, 0, 0, 0] = 0.25
+        return rgb_depth, alpha, {}
+
+    renderer._rasterization = fake_rasterization
+    out = renderer.render(
+        means=torch.zeros(1, 3),
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        scales=torch.ones(1, 3),
+        opacities=torch.ones(1),
+        colors_sh=torch.zeros(1, 4, 3),
+        w2c_per_view=torch.eye(4).view(1, 4, 4),
+    )
+
+    assert calls["render_mode"] == "RGB+D"
+    assert calls["packed"] is True
+    assert calls["backgrounds"] is None
+    torch.testing.assert_close(out["alpha_erp"], torch.full((1, 1, 1, 1), 0.25))
+    torch.testing.assert_close(out["rgb_erp"], torch.full((1, 3, 1, 1), 0.1875))
 
 
 def test_cube_renderer_omits_explicit_zero_background_for_packed_rgbd():
@@ -79,6 +116,17 @@ def test_cube_renderer_omits_explicit_zero_background_for_packed_rgbd():
     assert calls["render_mode"] == "RGB+D"
     assert calls["packed"] is True
     assert calls["backgrounds"] is None
+
+
+def test_cube2equirec_matches_input_dtype_for_grid_sample_and_valid_mask():
+    cube2equi = Cube2Equirec(face_w=2, equ_h=2, equ_w=4, fov_deg=90.0)
+    cube = torch.zeros(1, 1, 6, 2, 2, dtype=torch.float64)
+
+    out = cube2equi(cube)
+    mask = cube2equi.get_valid_mask(1, device=cube.device, dtype=cube.dtype)
+
+    assert out.dtype == torch.float64
+    assert mask.dtype == torch.float64
 
 
 def test_cube_renderer_reuses_static_tensors_for_same_device_and_dtype():

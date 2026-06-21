@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 
@@ -8,6 +9,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def _load_config(name):
     return OmegaConf.load(REPO_ROOT / "training" / "config" / "gs" / name)
+
+
+def _compose_config(name):
+    config_dir = str(REPO_ROOT / "training" / "config")
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        return compose(config_name=f"gs/{name.removesuffix('.yaml')}")
 
 
 def test_local_gs_config_enables_2x2_tangent_and_masked_rgb_defaults():
@@ -47,3 +54,22 @@ def test_gs_stage_configs_use_init_checkpoint_for_stage_handoff():
 
         assert cfg.checkpoint.resume_checkpoint_path is None
         assert cfg.checkpoint.init_checkpoint_path == init_path
+
+
+def test_gs_stage_configs_compose_with_gaussian_training_defaults():
+    config_names = [
+        "stage1_bootstrap.yaml",
+        "stage2_refine.yaml",
+        "stage2b_coverage.yaml",
+        "stage2c_novel_view.yaml",
+        "stage3_full_head.yaml",
+        "local.yaml",
+    ]
+
+    for config_name in config_names:
+        cfg = _compose_config(config_name)
+
+        assert cfg.model.enable_gaussian is True
+        assert cfg.model.gs_subgrid_size == 2
+        assert cfg.loss.gs.enabled is True
+        assert cfg.loss.gs.mask_rgb_by_valid is True

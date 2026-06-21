@@ -678,7 +678,18 @@ class Trainer:
         return True
 
     def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
-        tensor_keys = ["images", "depths", "extrinsics", "intrinsics", "cam_points", "world_points", "point_masks"]
+        tensor_keys = [
+            "images",
+            "depths",
+            "extrinsics",
+            "intrinsics",
+            "cam_points",
+            "world_points",
+            "point_masks",
+            "rgb_masks",
+            "depth_masks",
+            "source_gs_masks",
+        ]
         string_keys = ["seq_name"]
         for key in tensor_keys:
             if key in batch:
