@@ -1,6 +1,9 @@
 import math
 
+import numpy as np
+import pytest
 import torch
+from plyfile import PlyData
 
 from panovggt.render.gs_branch import (
     GSBranch,
@@ -371,6 +374,25 @@ def test_materialize_2x2_subgrid_pools_centers_and_dc_over_valid_pixels_only():
     torch.testing.assert_close(out["patch_valid"][0, 0, 0, 0, 0], torch.tensor([0.25]))
 
 
+def test_materialize_masks_nonfinite_geometry_inside_point_mask():
+    gs_params = _make_gs_params()
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+    point_masks = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    world_points[..., 0, 0, :] = float("nan")
+
+    out = _make_branch(min_valid_ratio=0.9).materialize(
+        gs_params=gs_params,
+        world_points=world_points,
+        images=images,
+        point_masks=point_masks,
+    )
+
+    assert torch.isfinite(out["centers"]).all()
+    torch.testing.assert_close(out["patch_valid"][0, 0, 0, 0], torch.tensor([0.75]))
+    torch.testing.assert_close(out["opacities"][0, 0, 0, 0], torch.tensor([0.0]))
+
+
 def test_materialize_2x2_depth_footprint_keeps_scale_and_mask_order():
     gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
     world_points = torch.zeros(1, 1, 4, 4, 3)
@@ -453,6 +475,36 @@ def test_aggregate_predictions_flattens_2x2_subgrid_gaussians():
     )
 
     assert agg["means"].shape == (4, 3)
+
+
+def test_materialize_rejects_mismatched_subgrid_param_shapes():
+    gs_params = _make_gs_params(patch_h=1, patch_w=1, subgrid_size=2)
+    gs_params["rotation"] = torch.zeros(1, 1, 1, 1, 4)
+    world_points = torch.zeros(1, 1, 4, 4, 3)
+    images = torch.zeros(1, 1, 3, 4, 4)
+
+    with pytest.raises(ValueError, match="rotation.*shape"):
+        _make_branch().materialize(gs_params, world_points, images)
+
+
+def test_gs_to_ply_filters_nonfinite_gaussians(tmp_path):
+    from panovggt.utils.gs_export import gs_to_ply
+
+    out_path = tmp_path / "finite_only.ply"
+    gs_to_ply(
+        means=torch.tensor([[0.0, 0.0, 0.0], [float("nan"), 1.0, 1.0]]),
+        scales=torch.ones(2, 3) * 0.01,
+        rotations=torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, float("inf"), 0.0, 0.0]]),
+        opacities=torch.tensor([0.5, 0.5]),
+        sh_dc=torch.zeros(2, 3),
+        sh_rest=torch.zeros(2, 3, 3),
+        out_path=str(out_path),
+    )
+
+    vertices = PlyData.read(out_path)["vertex"].data
+    assert len(vertices) == 1
+    for name in vertices.dtype.names:
+        assert np.isfinite(vertices[name]).all()
 
 
 def test_aggregate_predictions_uses_camera_poses_for_tangent_export():

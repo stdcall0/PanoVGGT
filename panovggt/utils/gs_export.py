@@ -21,6 +21,25 @@ def gs_to_ply(
     sh_rest: Optional[torch.Tensor],  # (N, 3, sh_extra) or (N, sh_extra, 3)
     out_path: str,
 ):
+    n = means.shape[0]
+    finite = (
+        torch.isfinite(means.reshape(n, -1)).all(dim=1)
+        & torch.isfinite(scales.reshape(n, -1)).all(dim=1)
+        & torch.isfinite(rotations.reshape(n, -1)).all(dim=1)
+        & torch.isfinite(opacities.reshape(n, -1)).all(dim=1)
+        & torch.isfinite(sh_dc.reshape(n, -1)).all(dim=1)
+    )
+    if sh_rest is not None:
+        finite = finite & torch.isfinite(sh_rest.reshape(n, -1)).all(dim=1)
+
+    means = means[finite]
+    scales = scales[finite]
+    rotations = rotations[finite]
+    opacities = opacities[finite]
+    sh_dc = sh_dc[finite]
+    if sh_rest is not None:
+        sh_rest = sh_rest[finite]
+
     means = means.detach().cpu().numpy().astype(np.float32)
     scales = scales.detach().cpu().numpy().astype(np.float32)
     rotations = rotations.detach().cpu().numpy().astype(np.float32)

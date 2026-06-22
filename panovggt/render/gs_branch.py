@@ -60,6 +60,63 @@ def _smooth_bounded_scale_multiplier(
     return torch.exp(log_mult), scale_log_raw
 
 
+def _validate_gs_params(
+    gs_params: Dict[str, torch.Tensor],
+    B: int,
+    S: int,
+    Hp: int,
+    Wp: int,
+    has_subgrid: bool,
+    Q: int,
+) -> None:
+    if has_subgrid:
+        prefix = (B, S, Hp, Wp, Q)
+        specs = {
+            "offset": (3,),
+            "scale": (3,),
+            "rotation": (4,),
+            "opacity": (1,),
+            "sh_dc": (3,),
+        }
+        for name, trailing in specs.items():
+            value = gs_params[name]
+            expected = prefix + trailing
+            if tuple(value.shape) != expected:
+                raise ValueError(
+                    f"Gaussian param '{name}' shape must be {expected}, "
+                    f"got {tuple(value.shape)}."
+                )
+        sh_rest = gs_params["sh_rest"]
+        if sh_rest.dim() != 7 or tuple(sh_rest.shape[:5]) != prefix or sh_rest.shape[5] != 3:
+            raise ValueError(
+                "Gaussian param 'sh_rest' shape must be "
+                f"{prefix + (3, 'K-1')}, got {tuple(sh_rest.shape)}."
+            )
+    else:
+        prefix = (B, S, Hp, Wp)
+        specs = {
+            "offset": (3,),
+            "scale": (3,),
+            "rotation": (4,),
+            "opacity": (1,),
+            "sh_dc": (3,),
+        }
+        for name, trailing in specs.items():
+            value = gs_params[name]
+            expected = prefix + trailing
+            if tuple(value.shape) != expected:
+                raise ValueError(
+                    f"Gaussian param '{name}' shape must be {expected}, "
+                    f"got {tuple(value.shape)}."
+                )
+        sh_rest = gs_params["sh_rest"]
+        if sh_rest.dim() != 6 or tuple(sh_rest.shape[:4]) != prefix or sh_rest.shape[4] != 3:
+            raise ValueError(
+                "Gaussian param 'sh_rest' shape must be "
+                f"{prefix + (3, 'K-1')}, got {tuple(sh_rest.shape)}."
+            )
+
+
 class GSBranch:
     """Stateless helper bound to a stage config. Renders and returns tensors."""
 
@@ -153,6 +210,18 @@ class GSBranch:
         if subgrid_size * subgrid_size != Q:
             raise ValueError(f"subgrid Gaussian count must be square, got Q={Q}.")
         assert patch_size * Hp == H and patch_size * Wp == W, (patch_size, Hp, Wp, H, W)
+        _validate_gs_params(gs_params, B, S, Hp, Wp, has_subgrid, Q)
+
+        finite_geometry = torch.isfinite(world_points).all(dim=-1)
+        if depth is not None:
+            d_for_mask = depth if depth.dim() == 4 else depth.squeeze(-1)
+            finite_geometry = finite_geometry & torch.isfinite(d_for_mask)
+        if point_masks is not None:
+            effective_point_masks = (
+                point_masks.to(device=world_points.device).bool() & finite_geometry
+            )
+        else:
+            effective_point_masks = finite_geometry
 
         def with_q(x: torch.Tensor) -> torch.Tensor:
             return x if has_subgrid else x.unsqueeze(4)
@@ -171,24 +240,24 @@ class GSBranch:
 
         # ---- centers ------------------------------------------------------
         patch_valid = None
-        if point_masks is not None:
+        if effective_point_masks is not None:
             if has_subgrid:
                 patch_valid = subpatch_valid_ratio(
-                    point_masks, patch_size, subgrid_size
+                    effective_point_masks, patch_size, subgrid_size
                 ).unsqueeze(-1)
             else:
-                patch_valid = patch_valid_ratio(point_masks, patch_size).unsqueeze(-1).unsqueeze(4)
+                patch_valid = patch_valid_ratio(effective_point_masks, patch_size).unsqueeze(-1).unsqueeze(4)
 
         if has_subgrid:
             centers_pp = (
-                subpatch_weighted_pool(world_points, point_masks, patch_size, subgrid_size)
-                if point_masks is not None
+                subpatch_weighted_pool(world_points, effective_point_masks, patch_size, subgrid_size)
+                if effective_point_masks is not None
                 else subpatch_pool(world_points, patch_size, subgrid_size)
             )
         else:
             centers_pp = (
-                patch_weighted_pool(world_points, point_masks, patch_size)
-                if point_masks is not None
+                patch_weighted_pool(world_points, effective_point_masks, patch_size)
+                if effective_point_masks is not None
                 else patch_pool(world_points, patch_size)
             ).unsqueeze(4)
         if self.detach_centers:
@@ -198,14 +267,14 @@ class GSBranch:
         # patch-pool the GT image to get a per-Gaussian DC bootstrap.
         if has_subgrid:
             img_pp = (
-                subpatch_weighted_pool(images, point_masks, patch_size, subgrid_size)
-                if point_masks is not None
+                subpatch_weighted_pool(images, effective_point_masks, patch_size, subgrid_size)
+                if effective_point_masks is not None
                 else subpatch_pool(images, patch_size, subgrid_size)
             )
         else:
             img_pp = (
-                patch_weighted_pool(images, point_masks, patch_size)
-                if point_masks is not None
+                patch_weighted_pool(images, effective_point_masks, patch_size)
+                if effective_point_masks is not None
                 else patch_pool(images, patch_size)
             )
             img_pp = img_pp.permute(0, 1, 3, 4, 2).contiguous().unsqueeze(4)
@@ -224,11 +293,11 @@ class GSBranch:
             d = depth if depth.dim() == 4 else depth.squeeze(-1)
             if has_subgrid:
                 scale_init = subpatch_depth_footprint_scale(
-                    d, patch_size, subgrid_size, H, valid_mask=point_masks
+                    d, patch_size, subgrid_size, H, valid_mask=effective_point_masks
                 )
             else:
                 scale_init = depth_footprint_scale(
-                    d, patch_size, H, valid_mask=point_masks
+                    d, patch_size, H, valid_mask=effective_point_masks
                 ).unsqueeze(4)
         elif self.scale_init_mode == "knn":
             scale_init = knn_scale(centers_pp.detach(), k=3)
