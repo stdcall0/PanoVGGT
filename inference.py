@@ -113,6 +113,7 @@ def normalize_gs_export_frame(
     local_points: torch.Tensor,
     camera_poses: torch.Tensor,
     depth: Optional[torch.Tensor],
+    point_masks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     """Match the normalized cam0 frame used by the GS render loss."""
     B, S, H, W, _ = world_points.shape
@@ -128,9 +129,27 @@ def normalize_gs_export_frame(
         )
 
     valid = torch.isfinite(local_points).all(dim=-1)
-    distances = local_points.norm(dim=-1).masked_fill(~valid, 0.0)
-    denom = valid.float().sum(dim=(1, 2, 3)).clamp(min=1e-8)
-    norm_factor = distances.sum(dim=(1, 2, 3)) / denom
+    if point_masks is not None:
+        if point_masks.dim() == 5 and point_masks.shape[-1] == 1:
+            point_masks = point_masks[..., 0]
+        if point_masks.shape != (B, S, H, W):
+            raise ValueError(
+                f"GS export point mask must have shape {(B, S, H, W)}, "
+                f"got {tuple(point_masks.shape)}"
+            )
+        valid = valid & point_masks.to(device=local_points.device).bool()
+    safe_local = torch.where(valid.unsqueeze(-1), local_points, torch.zeros_like(local_points))
+    distances = safe_local.norm(dim=-1)
+    valid_count = valid.float().sum(dim=(1, 2, 3))
+    raw_norm_factor = distances.sum(dim=(1, 2, 3)) / valid_count.clamp(min=1e-8)
+    norm_factor = torch.where(
+        valid_count > 0,
+        raw_norm_factor,
+        torch.ones_like(raw_norm_factor),
+    )
+    norm_factor = torch.nan_to_num(
+        norm_factor, nan=1.0, posinf=1e6, neginf=1.0
+    ).clamp(min=1e-6, max=1e6)
     scale = norm_factor.view(B, 1, 1, 1, 1)
 
     cam0_w2c = invert_homogeneous_matrix(camera_poses[:, :1])[:, 0]
@@ -207,7 +226,8 @@ def load_model(config_path: str, checkpoint_path: str, device: str, enable_gauss
         enable_point=mc.enable_point,
         aggregator=OmegaConf.to_container(mc.aggregator, resolve=True),
     )
-    if enable_gaussian or bool(getattr(mc, "enable_gaussian", False)):
+    requires_gaussian = enable_gaussian or bool(getattr(mc, "enable_gaussian", False))
+    if requires_gaussian:
         model_kwargs["enable_global_points"] = True
         model_kwargs["enable_gaussian"] = True
         model_kwargs["gs_sh_degree"] = int(getattr(mc, "gs_sh_degree", 1))
@@ -224,6 +244,19 @@ def load_model(config_path: str, checkpoint_path: str, device: str, enable_gauss
             break
     sd = {(k[7:] if k.startswith("module.") else k): v for k, v in ckpt.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
+    if requires_gaussian:
+        missing_gs = [key for key in missing if key.startswith("gaussian_head.")]
+        unexpected_gs = [key for key in unexpected if key.startswith("gaussian_head.")]
+        if missing_gs or unexpected_gs:
+            parts = []
+            if missing_gs:
+                parts.append(f"missing Gaussian head keys: {missing_gs[:5]}")
+            if unexpected_gs:
+                parts.append(f"unexpected Gaussian head keys: {unexpected_gs[:5]}")
+            raise RuntimeError(
+                "GS export requires a checkpoint trained with the Gaussian head; "
+                + "; ".join(parts)
+            )
     if missing:
         print(f"[load] missing keys  : {missing[:5]}{'…' if len(missing) > 5 else ''}")
     if unexpected:
@@ -703,6 +736,7 @@ def main(args: argparse.Namespace) -> None:
             local_points=local_t,
             camera_poses=poses_t,
             depth=depth_t,
+            point_masks=point_masks_t,
         )
         from panovggt.utils.gs_export import aggregate_predictions, gs_to_ply
         gs_conf = load_gs_conf(args.config)
