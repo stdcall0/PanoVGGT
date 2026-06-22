@@ -1274,8 +1274,28 @@ class Loss(nn.Module):
                 surface_depth = pred_target_depths.detach() if pred_target_depths is not None else None
             if surface_depth is not None:
                 margin = depth_render.new_tensor(self._gs_front_floater_margin)
-                front_err = F.relu(surface_depth - depth_render - margin).square()
                 front_weight = alpha_render * depth_render_mask
+                front_valid = (
+                    (front_weight > 0)
+                    & torch.isfinite(surface_depth)
+                    & torch.isfinite(depth_render)
+                )
+                front_weight = torch.where(
+                    front_valid,
+                    front_weight,
+                    torch.zeros_like(front_weight),
+                )
+                safe_surface_depth = torch.where(
+                    front_valid,
+                    surface_depth,
+                    torch.zeros_like(surface_depth),
+                )
+                safe_depth_render = torch.where(
+                    front_valid,
+                    depth_render,
+                    torch.zeros_like(depth_render),
+                )
+                front_err = F.relu(safe_surface_depth - safe_depth_render - margin).square()
                 front_weighted = torch.where(
                     front_weight > 0,
                     front_err * front_weight,

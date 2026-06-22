@@ -57,6 +57,35 @@ def erp_solid_angle_weights(height: int, device, dtype) -> torch.Tensor:
     return torch.cos(phi).clamp_min(0.0).view(1, 1, height, 1)
 
 
+def _weight_mask_like(
+    ref: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+):
+    weight_mask = torch.ones_like(ref[:, :1])
+    if mask is not None:
+        if mask.dim() == ref.dim() - 1:
+            mask = mask.unsqueeze(1)
+        weight_mask = weight_mask * mask.to(device=ref.device, dtype=ref.dtype)
+    if weight is not None:
+        weight_mask = weight_mask * weight.to(device=ref.device, dtype=ref.dtype)
+    return weight_mask
+
+
+def _sanitize_masked_pair(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+):
+    if mask is None and weight is None:
+        return pred, gt
+    keep = _weight_mask_like(pred, mask=mask, weight=weight) > 0
+    pred = torch.where(keep, pred, torch.zeros_like(pred))
+    gt = torch.where(keep, gt, torch.zeros_like(gt))
+    return pred, gt
+
+
 def _masked_weighted_mean(
     err: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
@@ -65,13 +94,7 @@ def _masked_weighted_mean(
 ) -> torch.Tensor:
     if mask is None and weight is None:
         return err.mean()
-    weight_mask = torch.ones_like(err[:, :1])
-    if mask is not None:
-        if mask.dim() == err.dim() - 1:
-            mask = mask.unsqueeze(1)
-        weight_mask = weight_mask * mask
-    if weight is not None:
-        weight_mask = weight_mask * weight
+    weight_mask = _weight_mask_like(err, mask=mask, weight=weight)
     err = torch.where(weight_mask > 0, err * weight_mask, torch.zeros_like(err))
     return err.sum() / (weight_mask.sum() * err.shape[1] + eps)
 
@@ -94,6 +117,7 @@ def masked_mse(
     weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
+    pred, gt = _sanitize_masked_pair(pred, gt, mask=mask, weight=weight)
     err = (pred - gt).square()
     return _masked_weighted_mean(err, mask=mask, weight=weight, eps=eps)
 
@@ -105,6 +129,7 @@ def masked_l1(
     weight: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
+    pred, gt = _sanitize_masked_pair(pred, gt, mask=mask, weight=weight)
     err = (pred - gt).abs()
     return _masked_weighted_mean(err, mask=mask, weight=weight, eps=eps)
 
@@ -117,6 +142,7 @@ def masked_charbonnier(
     charbonnier_eps: float = 1e-3,
     eps: float = 1e-6,
 ) -> torch.Tensor:
+    pred, gt = _sanitize_masked_pair(pred, gt, mask=mask, weight=weight)
     residual = pred - gt
     err = torch.sqrt(residual.square() + charbonnier_eps ** 2) - charbonnier_eps
     return _masked_weighted_mean(err, mask=mask, weight=weight, eps=eps)
@@ -183,8 +209,9 @@ class GaussianRenderLoss(nn.Module):
         total = self.rgb_weight * rgb_loss
 
         if self.ssim_weight > 0:
-            ssim_map = ssim(rgb_pred, rgb_gt, window_size=self.ssim_window)
             if mask is not None:
+                ssim_pred, ssim_gt = _sanitize_masked_pair(rgb_pred, rgb_gt, mask=mask)
+                ssim_map = ssim(ssim_pred, ssim_gt, window_size=self.ssim_window)
                 ssim_mask = _ssim_valid_window_mask(mask, self.ssim_window)
                 ssim_map = torch.where(
                     ssim_mask > 0,
@@ -198,6 +225,7 @@ class GaussianRenderLoss(nn.Module):
                     ssim_map.new_zeros(()),
                 )
             else:
+                ssim_map = ssim(rgb_pred, rgb_gt, window_size=self.ssim_window)
                 ssim_loss = 1.0 - ssim_map.mean()
             details["ssim"] = ssim_loss
             total = total + self.ssim_weight * ssim_loss

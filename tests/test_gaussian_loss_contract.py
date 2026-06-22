@@ -122,6 +122,43 @@ def test_gaussian_render_loss_ssim_ignores_nan_outside_valid_windows():
     torch.testing.assert_close(total, torch.tensor(0.0))
 
 
+def test_gaussian_render_loss_has_finite_grads_for_nan_outside_masks():
+    rgb_pred = torch.zeros(1, 3, 5, 5, requires_grad=True)
+    rgb_gt = torch.zeros_like(rgb_pred)
+    depth_pred = torch.zeros(1, 1, 5, 5, requires_grad=True)
+    depth_gt = torch.zeros_like(depth_pred)
+    with torch.no_grad():
+        rgb_pred[:, :, 0, 0] = float("nan")
+        depth_pred[:, :, 0, 0] = float("nan")
+
+    mask = torch.zeros(1, 1, 5, 5)
+    mask[:, :, 1:4, 1:4] = 1.0
+    depth_mask = torch.zeros(1, 1, 5, 5)
+    depth_mask[:, :, 2, 2] = 1.0
+
+    loss_fn = GaussianRenderLoss(
+        rgb_weight=1.0,
+        ssim_weight=1.0,
+        depth_weight=1.0,
+        ssim_window=3,
+        rgb_loss_type="mse",
+    )
+    total, _ = loss_fn(
+        rgb_pred,
+        rgb_gt,
+        mask=mask,
+        depth_pred=depth_pred,
+        depth_gt=depth_gt,
+        depth_mask=depth_mask,
+    )
+    total.backward()
+
+    assert torch.isfinite(rgb_pred.grad).all()
+    assert torch.isfinite(depth_pred.grad).all()
+    torch.testing.assert_close(rgb_pred.grad[:, :, 0, 0], torch.zeros(1, 3))
+    torch.testing.assert_close(depth_pred.grad[:, :, 0, 0], torch.zeros(1, 1))
+
+
 def test_erp_solid_angle_weights_are_symmetric_and_downweight_poles():
     weights = erp_solid_angle_weights(4, device=torch.device("cpu"), dtype=torch.float32)
 
@@ -359,6 +396,55 @@ def test_gaussian_front_floater_ignores_nan_outside_depth_mask():
     _, details = loss._compute_gs_loss(pred, gt)
 
     torch.testing.assert_close(details["front_floater"], torch.tensor(0.0))
+
+
+def test_gaussian_front_floater_has_finite_grad_for_nan_outside_depth_mask():
+    loss = Loss(
+        train_conf=False,
+        gs={
+            "enabled": True,
+            "rgb_weight": 0.0,
+            "ssim_weight": 0.0,
+            "depth_weight": 0.0,
+            "front_floater_weight": 1.0,
+            "front_floater_depth_source": "gt",
+            "front_floater_margin": 0.0,
+            "point_loss_weight": 0.0,
+            "camera_loss_weight": 0.0,
+        },
+    )
+    depth_render = torch.zeros(1, 1, 1, 2, 2, requires_grad=True)
+    with torch.no_grad():
+        depth_render[..., 0, 1] = float("nan")
+    fake_branch = _FakeBranch()
+    fake_branch.extra_out = {
+        "depth_erp": depth_render,
+        "alpha_erp": torch.ones(1, 1, 1, 2, 2),
+        "mask_erp": torch.ones(1, 1, 1, 2, 2),
+    }
+    loss.gs_branch = fake_branch
+    loss.gs_loss = _CaptureRenderLoss()
+    pred = {
+        "gs_world_points": torch.zeros(1, 1, 2, 2, 3),
+        "gs_camera_poses": _identity_poses(),
+        "depth": torch.ones(1, 1, 2, 2, 1),
+        "gaussian": _minimal_gaussian_params(),
+        "images": torch.zeros(1, 1, 3, 2, 2),
+    }
+    depth_masks = torch.ones(1, 1, 2, 2, dtype=torch.bool)
+    depth_masks[:, :, 0, 1] = False
+    gt = {
+        "imgs": torch.zeros(1, 1, 3, 2, 2),
+        "depths": torch.zeros(1, 1, 2, 2),
+        "valid_masks": torch.ones(1, 1, 2, 2, dtype=torch.bool),
+        "depth_masks": depth_masks,
+    }
+
+    gs_total, _ = loss._compute_gs_loss(pred, gt)
+    gs_total.backward()
+
+    assert torch.isfinite(depth_render.grad).all()
+    torch.testing.assert_close(depth_render.grad[..., 0, 1], torch.zeros(1, 1, 1))
 
 
 def test_trainer_side_novel_view_split_uses_full_gt_target_only_as_target():
