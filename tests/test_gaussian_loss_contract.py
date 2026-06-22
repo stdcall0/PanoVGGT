@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+import panovggt.render.losses as render_losses
 from panovggt.models.loss import Loss
 from panovggt.render.losses import (
     GaussianRenderLoss,
@@ -166,6 +167,67 @@ def test_erp_solid_angle_weights_are_symmetric_and_downweight_poles():
     torch.testing.assert_close(weights[..., 0, :], weights[..., -1, :])
     torch.testing.assert_close(weights[..., 1, :], weights[..., 2, :])
     assert weights[..., 0, :].item() < weights[..., 1, :].item()
+
+
+def test_gaussian_render_loss_applies_solid_angle_weights_to_depth():
+    mask = torch.ones(1, 1, 4, 1)
+    rgb = torch.zeros(1, 3, 4, 1)
+    depth_pred = torch.zeros(1, 1, 4, 1)
+
+    loss_fn = GaussianRenderLoss(
+        rgb_weight=0.0,
+        ssim_weight=0.0,
+        depth_weight=1.0,
+        solid_angle_weight=True,
+    )
+    pole_depth = torch.zeros_like(depth_pred)
+    pole_depth[:, :, 0, 0] = 1.0
+    equator_depth = torch.zeros_like(depth_pred)
+    equator_depth[:, :, 1, 0] = 1.0
+
+    _, pole_details = loss_fn(
+        rgb,
+        rgb,
+        mask=mask,
+        depth_pred=depth_pred,
+        depth_gt=pole_depth,
+        depth_mask=mask,
+    )
+    _, equator_details = loss_fn(
+        rgb,
+        rgb,
+        mask=mask,
+        depth_pred=depth_pred,
+        depth_gt=equator_depth,
+        depth_mask=mask,
+    )
+
+    assert pole_details["depth_l1"] < equator_details["depth_l1"]
+
+
+def test_gaussian_render_loss_applies_solid_angle_weights_to_ssim(monkeypatch):
+    def fake_ssim(pred, gt, window_size):
+        out = pred.new_ones(pred.shape)
+        out[:, :, 0, :] = 0.0
+        return out
+
+    monkeypatch.setattr(render_losses, "ssim", fake_ssim)
+    loss_fn = GaussianRenderLoss(
+        rgb_weight=0.0,
+        ssim_weight=1.0,
+        depth_weight=0.0,
+        ssim_window=1,
+        solid_angle_weight=True,
+    )
+
+    total, details = loss_fn(
+        torch.zeros(1, 3, 4, 1),
+        torch.zeros(1, 3, 4, 1),
+        mask=torch.ones(1, 1, 4, 1),
+    )
+
+    assert details["ssim"] < torch.tensor(0.25)
+    torch.testing.assert_close(total, details["ssim"])
 
 
 def test_combined_loss_initializes_gaussian_branch_loss_without_trainer():

@@ -20,11 +20,13 @@ conda run --no-capture-output -n panovggt python guides/matterport_data_preproce
 
 ## 1. 配置文件
 
-已创建 3 个训练 stage cfg：
+已创建 5 个训练 stage cfg：
 
 ```text
 training/config/gs/stage1_bootstrap.yaml
 training/config/gs/stage2_refine.yaml
+training/config/gs/stage2b_coverage.yaml
+training/config/gs/stage2c_novel_view.yaml
 training/config/gs/stage3_full_head.yaml
 ```
 
@@ -36,7 +38,11 @@ Stage 1 `gs/stage1_bootstrap`：从 `./checkpoints/model.pt` 加载官方 PanoVG
 
 Stage 2 `gs/stage2_refine`：从 Stage 1 的 model-only checkpoint 继续，训练 `gaussian_head.offset`、`scale`、`opacity`、`sh_dc`，仍然冻结 rotation 和 SH rest。这个是主训练阶段。
 
-Stage 3 `gs/stage3_full_head`：可选低学习率 full GS-head finetune，解冻 rotation 和 SH rest。只有 Stage 2 loss 已经平台化、可视化没有明显漂移时再进入；否则容易把 rotation/SH rest 学成补偿数据噪声的自由度。
+Stage 2b `gs/stage2b_coverage`：从 Stage 2 继续，加入 coverage 约束，帮助 opacity 不要只在局部解释训练视角。
+
+Stage 2c `gs/stage2c_novel_view`：从 Stage 2b 继续，启用 novel-view photometric bootstrap。这个阶段开始检查 source geometry、target pose、mask 之间的坐标和尺度一致性。
+
+Stage 3 `gs/stage3_full_head`：从 Stage 2c 继续，可选低学习率 full GS-head finetune，解冻 rotation 和 SH rest。只有 Stage 2c loss 已经平台化、可视化没有明显漂移时再进入；否则容易把 rotation/SH rest 学成补偿数据噪声的自由度。
 
 ## 3. 启动环境
 
@@ -69,6 +75,8 @@ outputs/gs_local_stage2
 ```text
 outputs/gs_stage1_bootstrap
 outputs/gs_stage2_refine
+outputs/gs_stage2b_coverage
+outputs/gs_stage2c_novel_view
 outputs/gs_stage3_full_head
 ```
 
@@ -77,6 +85,8 @@ outputs/gs_stage3_full_head
 ```bash
 rm -rf outputs/gs_stage1_bootstrap outputs/tensorboard/gs_stage1_bootstrap
 rm -rf outputs/gs_stage2_refine outputs/tensorboard/gs_stage2_refine
+rm -rf outputs/gs_stage2b_coverage outputs/tensorboard/gs_stage2b_coverage
+rm -rf outputs/gs_stage2c_novel_view outputs/tensorboard/gs_stage2c_novel_view
 rm -rf outputs/gs_stage3_full_head outputs/tensorboard/gs_stage3_full_head
 ```
 
@@ -106,16 +116,30 @@ Stage 2：
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 torchrun --standalone --nproc_per_node=8 training/launch.py --config gs/stage2_refine
 ```
 
+Stage 2b：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 torchrun --standalone --nproc_per_node=8 training/launch.py --config gs/stage2b_coverage
+```
+
+Stage 2c：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 torchrun --standalone --nproc_per_node=8 training/launch.py --config gs/stage2c_novel_view
+```
+
 Stage 3 可选：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 torchrun --standalone --nproc_per_node=8 training/launch.py --config gs/stage3_full_head
 ```
 
-如果 Stage 2 的最佳 checkpoint 不是最后一个，可以覆盖 Stage 3 的启动权重：
+跨阶段 handoff 使用 `checkpoint.init_checkpoint_path`，不要用 `checkpoint.resume_checkpoint_path`。后者只用于同一个 stage 的中断续训，会恢复 optimizer/scaler/epoch 等训练状态。
+
+如果 Stage 2c 的最佳 checkpoint 不是最后一个，可以覆盖 Stage 3 的启动权重：
 
 ```bash
-torchrun --standalone --nproc_per_node=8 training/launch.py --config gs/stage3_full_head   checkpoint.resume_checkpoint_path=./outputs/gs_stage2_refine/ckpts/checkpoint_75.pt
+torchrun --standalone --nproc_per_node=8 training/launch.py --config gs/stage3_full_head   checkpoint.init_checkpoint_path=./outputs/gs_stage2c_novel_view/ckpts/checkpoint_75.pt
 ```
 
 ## 6. 监控训练

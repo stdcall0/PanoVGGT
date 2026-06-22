@@ -213,12 +213,13 @@ class GaussianRenderLoss(nn.Module):
                 ssim_pred, ssim_gt = _sanitize_masked_pair(rgb_pred, rgb_gt, mask=mask)
                 ssim_map = ssim(ssim_pred, ssim_gt, window_size=self.ssim_window)
                 ssim_mask = _ssim_valid_window_mask(mask, self.ssim_window)
+                ssim_weight_mask = _weight_mask_like(ssim_map, mask=ssim_mask, weight=weight)
                 ssim_map = torch.where(
-                    ssim_mask > 0,
-                    ssim_map * ssim_mask,
+                    ssim_weight_mask > 0,
+                    ssim_map * ssim_weight_mask,
                     torch.zeros_like(ssim_map),
                 )
-                denom = ssim_mask.sum() * ssim_map.shape[1]
+                denom = ssim_weight_mask.sum() * ssim_map.shape[1]
                 ssim_loss = torch.where(
                     denom > 1e-6,
                     1.0 - (ssim_map.sum() / denom.clamp_min(1e-6)),
@@ -226,12 +227,21 @@ class GaussianRenderLoss(nn.Module):
                 )
             else:
                 ssim_map = ssim(rgb_pred, rgb_gt, window_size=self.ssim_window)
-                ssim_loss = 1.0 - ssim_map.mean()
+                if weight is not None:
+                    ssim_weight_mask = _weight_mask_like(ssim_map, weight=weight)
+                    denom = ssim_weight_mask.sum() * ssim_map.shape[1]
+                    ssim_loss = torch.where(
+                        denom > 1e-6,
+                        1.0 - ((ssim_map * ssim_weight_mask).sum() / denom.clamp_min(1e-6)),
+                        ssim_map.new_zeros(()),
+                    )
+                else:
+                    ssim_loss = 1.0 - ssim_map.mean()
             details["ssim"] = ssim_loss
             total = total + self.ssim_weight * ssim_loss
 
         if self.depth_weight > 0 and depth_pred is not None and depth_gt is not None:
-            d_l1 = masked_l1(depth_pred, depth_gt, depth_mask)
+            d_l1 = masked_l1(depth_pred, depth_gt, depth_mask, weight=weight)
             details["depth_l1"] = d_l1
             total = total + self.depth_weight * d_l1
 
